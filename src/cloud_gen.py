@@ -38,7 +38,7 @@ def cloud_gen(scene: RawSceneData):
     normals = np.zeros([0,3], dtype=np.float64)
     for (i, frame) in enumerate(scene.frames):
         #onlys = ['54', '58']
-        onlys = ['54', '58', '66', '69', '85']
+        onlys = ['54', '58', '62', '66', '69', '85']
         if not any([only in frame.colour_path for only in onlys]):
             continue
         #if i >= 20:
@@ -48,7 +48,14 @@ def cloud_gen(scene: RawSceneData):
         inv_view = transform_matrix.T
 
         depth_map = torch.from_numpy(frame.get_depth()).cuda()
+
+        # TODO: Codify this better.
         colour_map = torch.from_numpy(frame.get_colour()).cuda()
+        colour_map = torch.flip(colour_map, dims=[0])
+
+        # TODO: Compensate for fog.
+        #colour_map 
+
         frame_coords, frame_colours, tex = _depth_to_3D(depth_map, inv, inv_view, scene.proj_params.znear, scene.proj_params.zfar, colour_map)
 
         # First we must convert out of RGB and into screen space normals. Then,
@@ -63,7 +70,7 @@ def cloud_gen(scene: RawSceneData):
         frame_normals = torch.matmul(frame_normals, normal_transform)
         frame_normals = frame_normals / torch.linalg.norm(frame_normals, dim=1).unsqueeze(-1)
 
-        frame_colours = tex
+        #frame_colours = tex
 
         coords = np.concatenate((coords, frame_coords.detach().to(torch.float64).cpu()), axis=0)
         colours = np.concatenate((colours, frame_colours.detach().to(torch.float64).cpu()), axis=0)
@@ -149,9 +156,9 @@ def _infer_zparams(scene: RawSceneData, image_groups: List[List[str]]):
     zstats_buf[0] = zbest[0]
     zstats_buf[1] = zbest[1]
 
-    for t in range(0, 200):
+    for t in range(0, 500):
         loss = optimizer.step(closure=objective_fn)
-        if loss < 0.0007:
+        if loss < 0.0013:
             break
 
     zstats = torch.exp(zstats_param)
@@ -197,7 +204,7 @@ def _depth_to_3D(depth_map, inv_projection, inv_view, znear, zfar, colour_map=No
     point_3D = point_homogeneous_world[:,:3] / point_homogeneous_world[:,3].reshape([B, 1])
 
     if colour_map is not None:
-        colours = colour_map.reshape([shape[0] * shape[1], 4])[:,:3]
+        colours = colour_map.reshape([shape[0] * shape[1], 4])[:,:3] / 255
     else:
         colours = flat_depth_map
 
