@@ -188,10 +188,21 @@ def _infer_zparams(scene: RawSceneData):
                 depth_map = torch.from_numpy(frame.get_depth()).cuda()
                 depth_map_cache[cam_idx] = depth_map
 
-            shape = depth_map.shape
-            coords, _, tex = _depth_to_3D(depth_map, inv_proj, inv_view, zstats[0], zstats[1])    
+            # 2D coordinates of the features.
+            pixel_coords_2D = []
+            for (i, (x, y)) in enumerate(frame_features.coords_2D):
+                id_3D = frame_features.point_3D_ids[i]
+                if id_3D == -1:
+                    continue
+                pixel_coords_2D.append([x, 1440 - y])
+            pixel_coords_2D = np.array(pixel_coords_2D, dtype=np.int64)
+            pixel_coords_2D = torch.tensor(pixel_coords_2D).cuda()
+
+            coords_3D, _, tex = _depth_to_3D(depth_map, inv_proj, inv_view, 
+                    zstats[0], zstats[1], pixel_coords_2D=pixel_coords_2D)    
 
             # Find depths of features.
+            valid_i = 0
             for (i, (x, y)) in enumerate(frame_features.coords_2D):
                 id_3D = frame_features.point_3D_ids[i]
                 if id_3D == -1:
@@ -202,13 +213,11 @@ def _infer_zparams(scene: RawSceneData):
                 #if err >= 0.6:
                 #    continue
 
-                nearest_x = np.round(x).astype(np.int64)
-                nearest_y = 1440 - np.round(y).astype(np.int64)
-                point_3D = coords[nearest_y * shape[1] + nearest_x]
                 if id_3D in id_to_point_predictions:
-                    id_to_point_predictions[id_3D].append(point_3D)
+                    id_to_point_predictions[id_3D].append(coords_3D[valid_i])
                 else:
-                    id_to_point_predictions[id_3D] = [point_3D]
+                    id_to_point_predictions[id_3D] = [coords_3D[valid_i]]
+                valid_i += 1
 
         # For each 3D point, compute standard deviation.
         loss = 0
@@ -348,29 +357,35 @@ def _infer_fog_params(scene: RawSceneData, image_groups: List[List[str]]):
     pass
     
 
-def _depth_to_3D(depth_map, inv_projection, inv_view, znear, zfar, colour_map=None):
+def _depth_to_3D(depth_map, inv_projection, inv_view, znear, zfar, 
+        colour_map=None, pixel_coords_2D=None):
     shape = depth_map.shape
-    B = shape[0] * shape[1]
 
-    flat_depth_map = depth_map.reshape([B, 3])[:,0]
+    # You can optionally pass in pixel coordinates or they can be automatically
+    # derived from the depth_map.
+    shape = depth_map.shape
+    if pixel_coords_2D is None:
+        y_coords, x_coords = torch.meshgrid(torch.arange(shape[0]).cuda(), torch.arange(shape[1]).cuda(), indexing='ij')
+        x_coords = x_coords.flatten()
+        y_coords = y_coords.flatten()
+        pixel_coords_2D = torch.stack([x_coords, y_coords], axis=-1)
+        B = shape[0] * shape[1]
+    else:
+        B = len(pixel_coords_2D)
 
     # Create homogenous normalized coordinates to match each depth map pixel.
     # Shape them into [B, 4].
-    shape = depth_map.shape
-    y_coords, x_coords = torch.meshgrid(torch.arange(shape[0]).cuda(), torch.arange(shape[1]).cuda(), indexing='ij')
-    x_coords = x_coords.flatten()
-    y_coords = y_coords.flatten()
-    x_coords = 2 * x_coords / shape[1] - 1 + 1 / shape[1]
-    y_coords = 2 * y_coords / shape[0] - 1 + 1 / shape[0]
-    #x_coords = -x_coords
+    x_coords = 2 * pixel_coords_2D[:,0] / shape[1] - 1 + 1 / shape[1]
+    y_coords = 2 * pixel_coords_2D[:,1] / shape[0] - 1 + 1 / shape[0]
     z_coords = torch.zeros_like(x_coords)
-    pixel_coordinates = torch.stack([x_coords, y_coords, z_coords, torch.ones_like(x_coords, dtype=torch.float32)], axis=-1)
+    projected_coords = torch.stack([x_coords, y_coords, z_coords, torch.ones_like(x_coords, dtype=torch.float32)], axis=-1)
+    depths = depth_map[pixel_coords_2D[:,1], pixel_coords_2D[:,0]][:,0]
 
     # Calculate the view space coordinates
-    view_coordinates = pixel_coordinates @ inv_projection
+    view_coordinates = projected_coords @ inv_projection
     view_coordinates = view_coordinates / view_coordinates[:,3].reshape([B, 1])
     view_coordinates = view_coordinates / torch.linalg.norm(view_coordinates[:,:3], dim=1).unsqueeze(-1)
-    z_want = znear + flat_depth_map * (zfar - znear)
+    z_want = znear + depths * (zfar - znear)
     z_want = -z_want
     view_coordinates = view_coordinates * (z_want / view_coordinates[:,2]).unsqueeze(-1)
     view_coordinates[:,3] = 1
@@ -384,11 +399,11 @@ def _depth_to_3D(depth_map, inv_projection, inv_view, znear, zfar, colour_map=No
     if colour_map is not None:
         colours = colour_map.reshape([shape[0] * shape[1], 3])
     else:
-        colours = flat_depth_map
+        colours = depths
 
-    tex = torch.stack((x_coords * 0.5 + 0.5, y_coords * 0.5 + 0.5, flat_depth_map), dim=1)
+    #tex = torch.stack((x_coords * 0.5 + 0.5, y_coords * 0.5 + 0.5, flat_depth_map), dim=1)
 
-    return point_3D, colours, tex
+    return point_3D, colours, None
 
 
 def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y, znear, zfar):
