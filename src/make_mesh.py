@@ -18,6 +18,7 @@ def run(points, colours, normals):
 
     # Create a Trimesh object using the poisson method
     radii = [0.01, 0.05, 0.1, 0.2, 0.3]
+    exit(0)
     print("Generating mesh")
     mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(pcd, o3d.utility.DoubleVector(radii))
 

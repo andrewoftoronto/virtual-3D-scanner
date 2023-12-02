@@ -16,7 +16,10 @@ class ProjectionParameters:
 class Frame:
     def __init__(self, file_path: str, transform_matrix: str):
         self.file_path = file_path
-        self.transform_matrix = np.array(transform_matrix)
+
+        # The given matrix is useful for the typical opengl multiplication 
+        # order, but this project uses the opposite convention.
+        self.transform_matrix = np.array(transform_matrix).T
 
 
 class TransformsData:

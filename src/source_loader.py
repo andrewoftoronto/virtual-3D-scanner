@@ -1,10 +1,10 @@
-from typing import List
+from typing import List, Optional
 import os
 import numpy as np
 import cv2
 from PIL import Image
 from .transforms import TransformsData, Frame as TFrame, read_transforms
-
+from .matching.match_loader import load_matches, PointData
 
 class DelayLoadMap:
     def __init__(self, path):
@@ -16,8 +16,8 @@ class Frame:
     ''' Info about one frame of source data, including camera transform and 
         the colour/normal/depth maps.'''
     
-    def __init__(self, transform_frame: TFrame, colour_path: str, colour_map, depth_map, normal_map):
-        self.transform = transform_frame.transform_matrix
+    def __init__(self, transform_frame: Optional[TFrame], colour_path: str, colour_map, depth_map, normal_map):
+        self.transform = transform_frame.transform_matrix if transform_frame is not None else None
         self.colour_path = colour_path
         self.colour_map = colour_map
         self.depth_map = depth_map
@@ -42,9 +42,17 @@ class Frame:
 class RawSceneData:
     ''' Collection of all source data used to describe a scene. '''
 
-    def __init__(self, transform_scene_data: TransformsData, frames: List[Frame]):
+    def __init__(self, transform_scene_data: TransformsData, frames: List[Frame], extra_frames: List[Frame]):
         self.proj_params = transform_scene_data.parameters
         self.frames = frames
+        self.extra_frames = extra_frames
+        self.feature_data : PointData = None
+
+    def lookup(self, frame_search_term: str):
+        for frame in self.frames:
+            if frame_search_term in frame.colour_path:
+                return frame
+        raise Exception(f"Unable to find frame matching query: {frame_search_term}") 
 
 
 def load(transforms_path: str):
@@ -57,17 +65,46 @@ def load(transforms_path: str):
 
     frames = []
     for tframe in transforms.frames:
-        colour = _load_map(tframe.file_path, 'colour', base_path)
+        colour = _load_map(tframe.file_path, 'images', base_path)
         depth = _load_map(tframe.file_path, 'depth', base_path)
         normal = _load_map(tframe.file_path, 'normal', base_path)
         frame = Frame(tframe, tframe.file_path, colour, depth, normal)
         frames.append(frame)
 
-    return RawSceneData(transforms, frames)
+    extra_images_path = os.path.join(base_path, "extra-images")
+    extra_frame_names = []
+    if os.path.exists(extra_images_path):
+        extra_frame_names = os.listdir(extra_images_path)
+    extra_frames = []
+    for name in extra_frame_names:
+        image_file_path = os.path.join(extra_images_path, name)
+        colour = _load_map(image_file_path, 'extra-images', base_path)
+        depth = _load_map(image_file_path, 'extra-depth', base_path)
+        normal = _load_map(image_file_path, 'extra-normal', base_path)
+        frame = Frame(None, image_file_path, colour, depth, normal)
+        extra_frames.append(frame)
+
+    scene_data = RawSceneData(transforms, frames, extra_frames)
+
+    # Load 3D feature matches. We also correct each image to have the actual
+    # Frame rather than just the name of the image.
+    points_3D_path = os.path.join(base_path, "colmap_text/points3D.txt")
+    points_2D_path = os.path.join(base_path, "colmap_text/images.txt")
+    feature_data = load_matches(points_3D_path, points_2D_path)
+    for (_id, frame_features) in feature_data.id_to_frame_features.items():
+        frame_features.frame = scene_data.lookup(frame_features.frame)
+    feature_data.matches = [
+        [(scene_data.lookup(frame), x, y) for (frame, x, y) in point_matches]
+        for point_matches in feature_data.matches
+    ]
+
+    scene_data.feature_data = feature_data
+    return scene_data
 
 
 def _load_map(colour_path: str, type: str, base_path: str = None):
-    valid_types = ['colour', 'depth', 'normal']
+    valid_types = ['images', 'depth', 'normal', 
+            'extra-images', 'extra-depth', 'extra-normal']
 
     if not os.path.isabs(colour_path):
         path = os.path.join(base_path, colour_path)
@@ -77,10 +114,10 @@ def _load_map(colour_path: str, type: str, base_path: str = None):
     if type not in valid_types:
         raise Exception(f"Invalid map type to load: {type}")
     
-    if type != 'colour':
-        path = path.replace('images/', f"{type}/")
+    path = os.path.abspath(path).replace('\\', '/')
+    if type != 'images' and type != 'extra-images':
+        path = path.replace('extra-images/', f"{type}/").replace('images/', f"{type}/")
 
-    path = os.path.abspath(path)
     image = _load_image_without_extension(path)
     return image
 
