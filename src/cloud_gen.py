@@ -18,23 +18,12 @@ from .source_loader import RawSceneData
         ('066', 1440 - 743, 1390)
     ]
 ]'''
-
-# List of groups where each frame in the group includes a pixel that should be
-# the same colour up close. They don't necessarily need to be at the same
-# physical spatial location.
-# Each such frame entry is (name, Y pixel, X pixel). Name can be a substring 
-# of the colour map file name.
-fog_inference_groups = [
-    #[
-    #    ('085', 1440 - 282, 402),
-    #    ('058', 1440 - 523, 1348)
-    #],
-    [
-        ('000', 720, 1280),
-        ('004', 720, 1280),
-        ('010', 720, 1280),
-        ('011', 720, 1280)
-    ]
+ground_truth_frames = ['066', '069']
+orientation_constraints = [
+    ['066', '067', '068', '069']
+]
+lineup_constraints = [
+    ['066', '067', '068', '069']
 ]
 
 def cloud_gen(scene: RawSceneData):
@@ -60,9 +49,6 @@ def cloud_gen(scene: RawSceneData):
     # Infer zparams using images that point to the same place.
     _infer_zparams(scene)
 
-    # Infer fog parameters from images that point to the same place.
-    _infer_fog_params(scene, fog_inference_groups)
-
     inv = _inverse_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear), torch.tensor(scene.proj_params.zfar)).cuda().T
 
     coords = np.zeros([0,3], dtype=np.float64)
@@ -86,9 +72,8 @@ def cloud_gen(scene: RawSceneData):
         colour_map = torch.flip(colour_map, dims=[0])
         colour_map = colour_map[:,:,:3] / 255
 
-        # TODO: Compensate for fog.
         full_depths = scene.proj_params.znear + (scene.proj_params.zfar - scene.proj_params.znear) * depth_map
-        colour_map = unfog(colour_map, full_depths, scene.fog_colour, scene.fog_density)
+        #colour_map = unfog(colour_map, full_depths, scene.fog_colour, scene.fog_density)
 
         frame_coords, frame_colours, tex = _depth_to_3D(depth_map, inv, inv_view, scene.proj_params.znear, scene.proj_params.zfar, colour_map)
 
@@ -144,113 +129,216 @@ def make_rotation(quaternions):
 
 def _infer_zparams(scene: RawSceneData):
 
+    fl_x = scene.proj_params.fl_x
+    fl_y = scene.proj_params.fl_y
+    w = scene.proj_params.w
+    h = scene.proj_params.h
+
+    shape = scene.frames[0].get_depth().shape
+
+    inv_proj = _inverse_projection_matrix(w, h, fl_x, fl_y, 
+            torch.tensor(0.1, dtype=torch.float32), 
+            torch.tensor(1000,  dtype=torch.float32)).T.cuda()
+
+    # Camera translations and rotations grouped in a single tensor each.
+    n_frames = len(scene.frames)
+    original_camera_translations = torch.zeros(size=[n_frames, 3]).cuda()
+    original_camera_rotations = torch.zeros(size=[n_frames, 3, 3]).cuda()
+    for (cam_idx, frame) in enumerate(scene.frames):
+        transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
+        inv_view = transform_matrix
+        original_camera_translations[cam_idx] = inv_view[3,:3]
+        original_camera_rotations[cam_idx] = inv_view[:3,:3]
+
+    # Create tensors for: 
+    # - Number of frames that contain each feature.
+    # - Recording the 2D pixel coords of each frame-feature.
+    # - Recording the depth of each frame-feature.
+    # - Recording the camera used by each frame-feature.
+    feature_data = scene.feature_data
+    n_features = scene.feature_data.n_features()
+    n_frame_features = scene.feature_data.n_frame_features()
+    feature_to_n_frames = torch.zeros(size=[n_features], dtype=torch.int64).cuda()
+    frame_feature_pixel_coords = torch.zeros(size=[n_frame_features, 2], dtype=torch.float32).cuda()
+    frame_feature_depths = torch.zeros(size=[n_frame_features], dtype=torch.float32).cuda()
+    frame_feature_to_cam = torch.zeros(size=[n_frame_features], dtype=torch.int64).cuda()
+
+    total_frame_feature_index = 0
+    for feature_index in range(n_features):
+
+        # Frame-features from the same feature are grouped together.
+        matches_2D = feature_data.matches[feature_index]
+        feature_to_n_frames[feature_index] = len(matches_2D) 
+
+        # Iterate through frame-features of this point.
+        for (frame_features, x, y) in matches_2D:
+            y = 1440 - y
+
+            frame = frame_features.frame
+            depth = frame.get_depth()[int(round(y)), int(round(x)), 0]
+
+            frame_feature_pixel_coords[total_frame_feature_index, 0] = x
+            frame_feature_pixel_coords[total_frame_feature_index, 1] = y
+            frame_feature_depths[total_frame_feature_index] = float(depth)
+            frame_feature_to_cam[total_frame_feature_index] = frame.index
+            total_frame_feature_index += 1
+
+    # Create group tensor indicating where in frame_features, each feature 
+    # starts and ends.
+    feature_groups = torch.concat(
+            (torch.tensor([0]).cuda(), torch.cumsum(feature_to_n_frames, dim=0)), 
+            dim=0
+    )
+
+    # Near and far parameters.
     zstats_buf = torch.tensor([-0.8, 6.64]).cuda()
     zstats_param = torch.nn.Parameter(zstats_buf, requires_grad=True)
 
+    # Camera position parameters.
     cam_pos_buf = torch.zeros(size=[len(scene.frames), 3]).cuda() 
     cam_param = torch.nn.Parameter(cam_pos_buf, requires_grad=True)
 
+    # camera orientation parameters.
     cam_orientation_buf = torch.concat(
         (torch.zeros(size=[len(scene.frames), 3]), torch.ones(size=[len(scene.frames), 1])),
         axis=1
     ).cuda().detach()
     cam_orientation_param = torch.nn.Parameter(cam_orientation_buf, requires_grad=True)
 
-    fl_x = scene.proj_params.fl_x
-    fl_y = scene.proj_params.fl_y
-    w = scene.proj_params.w
-    h = scene.proj_params.h
+    # Ground truth position and ground truth distance.
+    fixed_cam_index = scene.lookup(ground_truth_frames[0]).index
+    second_cam_index = scene.lookup(ground_truth_frames[1]).index
 
-    depth_map_cache = {}
+    # Orientation constraints.
+    processed_orientation_constraints = []
+    for constraint in orientation_constraints:
+        processed = [scene.lookup(search_term) for search_term in constraint]
+        processed_orientation_constraints.append(processed)
+
+        first_frame = processed[0]
+        for frame in processed[1:]:
+            frame.transform[:3,:3] = first_frame.transform[:3,:3]
+            original_camera_rotations[frame.index] = original_camera_rotations[first_frame.index]
+
+    # Lineup constraints.
+    processed_lineup_constraints = []
+    for constraint in lineup_constraints:
+        processed = [scene.lookup(search_term) for search_term in constraint]
+        processed_lineup_constraints.append(processed)
 
     def objective_fn():
         optimizer.zero_grad()
+
         zstats = torch.exp(zstats_param)
-        inv_proj = _inverse_projection_matrix(w, h, fl_x, fl_y, torch.tensor(0.1, dtype=torch.float32), torch.tensor(1000,  dtype=torch.float32)).T.cuda()
 
-        id_to_point_predictions = {}
-        for (cam_idx, (_, frame_features)) in enumerate(scene.feature_data.id_to_frame_features.items()):
-            frame = frame_features.frame
+        # Combine our adjusted parameters on top of the old camera parameters.
+        total_translations = original_camera_translations + cam_param
+        total_rotations = original_camera_rotations @ make_rotation(cam_orientation_param)
+        total_transforms = torch.zeros(size=[n_frames, 4, 4]).cuda()
+        total_transforms[:, 3, 3] = 1
+        total_transforms[:, :3, :3] = total_rotations
+        total_transforms[:, 3, :3] = total_translations
 
-            # Transform is view-to-world.
-            transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
-            inv_view = transform_matrix
+        inv_view = total_transforms[frame_feature_to_cam]
 
-            old_rotation = inv_view[:3,:3].clone()
-            add_rotation = make_rotation(cam_orientation_param[cam_idx].unsqueeze(0))[0]
-            new_rotation = old_rotation @ add_rotation
-            inv_view[:3,:3] = new_rotation
-            inv_view[3:,:3] = inv_view[3:,:3].clone() + cam_param[cam_idx]
+        coords_3D, _, _ = _depth_to_3D(frame_feature_depths, inv_proj, inv_view, 
+                    zstats[0], zstats[1], pixel_coords_2D=frame_feature_pixel_coords, 
+                    uses_depth_map=False, shape=shape)
+        
+        # Compute means of 3D points for each feature.
+        coord_cumsum = torch.concat(
+                (torch.tensor([[0, 0, 0]]).cuda(), torch.cumsum(coords_3D.to(torch.float64), dim=0)), 
+                dim=0
+        )
+        means_3D = (coord_cumsum[feature_groups[1:]] - coord_cumsum[feature_groups[:-1]]).to(torch.float32) / feature_to_n_frames.view(-1, 1)
 
-            if cam_idx in depth_map_cache:
-                depth_map = depth_map_cache[cam_idx]
-            else:
-                depth_map = torch.from_numpy(frame.get_depth()).cuda()
-                depth_map_cache[cam_idx] = depth_map
+        # Compute deviation from means.
+        repeats = torch.arange(0, n_features).cuda().repeat_interleave(feature_to_n_frames)
+        extended_means = means_3D[repeats]
+        deviations = torch.norm(coords_3D - extended_means, dim=1)
 
-            # 2D coordinates of the features.
-            pixel_coords_2D = []
-            for (i, (x, y)) in enumerate(frame_features.coords_2D):
-                id_3D = frame_features.point_3D_ids[i]
-                if id_3D == -1:
-                    continue
-                pixel_coords_2D.append([x, 1440 - y])
-            pixel_coords_2D = np.array(pixel_coords_2D, dtype=np.int64)
-            pixel_coords_2D = torch.tensor(pixel_coords_2D).cuda()
+        # TODO: Weighting?
+        loss = torch.mean(deviations)
 
-            coords_3D, _, tex = _depth_to_3D(depth_map, inv_proj, inv_view, 
-                    zstats[0], zstats[1], pixel_coords_2D=pixel_coords_2D)    
+        #err =  scene.feature_data.errs[point_index]
+        #weight = 1 / (err + 1) ** 2
 
-            # Find depths of features.
-            valid_i = 0
-            for (i, (x, y)) in enumerate(frame_features.coords_2D):
-                id_3D = frame_features.point_3D_ids[i]
-                if id_3D == -1:
-                    continue
-
-                point_index = scene.feature_data.id_to_point_index[id_3D]
-                err =  scene.feature_data.errs[point_index]
-                #if err >= 0.6:
-                #    continue
-
-                if id_3D in id_to_point_predictions:
-                    id_to_point_predictions[id_3D].append(coords_3D[valid_i])
-                else:
-                    id_to_point_predictions[id_3D] = [coords_3D[valid_i]]
-                valid_i += 1
-
-        # For each 3D point, compute standard deviation.
-        loss = 0
-        total_weight = 0
-        for (id_3D, predictions) in id_to_point_predictions.items():
-            point_index = scene.feature_data.id_to_point_index[id_3D]
-            err =  scene.feature_data.errs[point_index]
-            weight = 1 / (err + 1) ** 2
-
-            predictions = torch.stack(predictions)
-            mean = predictions.mean(axis=0).unsqueeze(0)
-            loss = loss + torch.mean(torch.linalg.norm(predictions - mean, axis=1)) * weight
-            total_weight += weight
-
-        loss = loss / total_weight
         loss.backward()
-        print(loss.detach())
+        #print(loss.detach())
         return loss
     
-    optimizer = torch.optim.Adam([zstats_param, cam_param, cam_orientation_param], lr=2e-2)
+    optimizer = torch.optim.Adam([zstats_param, cam_param, cam_orientation_param], lr=2e-1)
 
     cam_param.requires_grad = False
     cam_orientation_param.requires_grad = False
-    for t in range(0, 50):
-        loss = optimizer.step(closure=objective_fn)
 
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = 2e-3
+    for t in range(0, 100):
+
+        if t == 50:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 2e-2
+
+        loss = optimizer.step(closure=objective_fn)
+        print(f"Step {t}: ", loss)
 
     cam_param.requires_grad = True
     cam_orientation_param.requires_grad = True
-    for t in range(0, 1000):
+    for t in range(0, 0 * 6000):
+
+        if t == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 2e-1
+        if t == 2000:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 2e-2
+        if t == 4000:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 2e-3
+
         loss = optimizer.step(closure=objective_fn)
+        if t % 10 == 0:
+            print(f"Step {t}: ", loss)
+
+        # Preserve some things about the first two cameras to prevent degenerate
+        # solution:
+        # - first cam's original position is taken as ground truth.
+        # - second cam's distance to first cam is taken as ground truth.
+        cam_param.data[fixed_cam_index] = 0
+        original_dist = torch.norm(original_camera_translations[fixed_cam_index] - original_camera_translations[second_cam_index])
+        second_to_first = ((original_camera_translations[fixed_cam_index] + cam_param.data[fixed_cam_index]) - 
+                (original_camera_translations[second_cam_index] + cam_param.data[second_cam_index]))
+        new_dist = torch.norm(second_to_first)
+        cam_param.data[second_cam_index] = cam_param.data[second_cam_index] + second_to_first / new_dist * (new_dist - original_dist)
+        second_to_first = ((original_camera_translations[fixed_cam_index] + cam_param.data[fixed_cam_index]) - 
+                (original_camera_translations[second_cam_index] + cam_param.data[second_cam_index]))
+        new_dist = torch.norm(second_to_first)
+        
+        # Enforce orientation constaints.
+        # Sets of frames are known to share the exact same orientation as the
+        # first frame in the constraint.
+        for constraint in processed_orientation_constraints:
+            first_orientation_param  = cam_orientation_param.data[constraint[0].index]
+            for frame in constraint[1:]:
+                cam_orientation_param.data[frame.index] = first_orientation_param
+
+        # Enforce lineup constraints.
+        # Sets of frames are known to be located exactly in the forward or 
+        # backward direction from the first frame in the constraint.
+        for constraint in processed_lineup_constraints:
+            first_frame = constraint[0]
+            start = original_camera_translations[first_frame.index] + cam_param.data[first_frame.index]
+            rotation = original_camera_rotations[first_frame.index] @ make_rotation(cam_orientation_param[first_frame.index].unsqueeze(0))[0]
+            dir = rotation[2,:]
+            for frame in constraint[1:]:
+                old_pos = original_camera_translations[frame.index] + cam_param.data[frame.index]
+                z = (old_pos - start).dot(dir)
+                new_pos = start + z * dir
+                cam_param.data[frame.index] = new_pos - original_camera_translations[frame.index]
+                pass
+
+        if loss < 0.05:
+            break
+
 
     zstats = torch.exp(zstats_param)
     scene.proj_params.znear = float(zstats[0].detach())
@@ -258,113 +346,26 @@ def _infer_zparams(scene: RawSceneData):
     print(f"Selected znear and zfar: {scene.proj_params.znear} and {scene.proj_params.zfar}")
     
     # Permanently apply our adjusted camera positions.
-    for (cam_idx, (_, frame_features)) in enumerate(scene.feature_data.id_to_frame_features.items()):
-        frame = frame_features.frame
+    for (cam_idx, frame) in enumerate(scene.frames):
         frame.transform[:3,:3] = np.matmul(frame.transform[:3:,:3], make_rotation(cam_orientation_param[cam_idx].unsqueeze(0)).detach().cpu().numpy()) 
         frame.transform[3:,:3] = frame.transform[3:,:3] + cam_param[cam_idx].detach().cpu().numpy()
 
     pass
-
-
-def unfog(foggy_colour, depth, fog_colour, fog_density):
-    #fog_density = torch.exp(fog_density_log)
-    if len(foggy_colour.shape) == 3:
-        fog_colour = fog_colour.reshape([1, 1, 3])
-        fog_density = fog_density.reshape([1, 1, 1])
-    recovered_colour = foggy_colour - (
-        fog_colour * (1 - torch.exp(-depth * fog_density)) / 
-        torch.exp(-depth * fog_density)
-    )
-    return recovered_colour
-
-def fog(initial_colour, depth, fog_colour, fog_density_log):
-    fog_density = torch.exp(fog_density_log)
-    interpolant = torch.exp(-depth * fog_density)
-    predicted_colour = initial_colour * interpolant + fog_colour * (1 - interpolant)
-    return predicted_colour
-
-def _infer_fog_params(scene: RawSceneData, image_groups: List[List[str]]):
-
-    # Assemble frames that show the same colour.
-    frame_groups = []
-    for image_group in image_groups:
-        frame_group = []
-        for (image_name, y, x) in image_group:
-            
-            # TODO: This looks stupid and can use hashmaps instead.
-            selected_frame = None
-            for frame in chain(scene.frames, scene.extra_frames):
-                if image_name in frame.colour_path:
-                    selected_frame = frame
-                    break
-            if selected_frame is None:
-                raise Exception(f"No match found for fog inference image: {image_name}")
-            frame_group.append([selected_frame, y, x])
-
-        frame_groups.append(frame_group)
-
-    fog_colour_buf = torch.tensor([0.5, 0.5, 0.5]).cuda()
-    fog_colour_param = torch.nn.Parameter(fog_colour_buf, requires_grad=True)
-
-    fog_density_log_buf = torch.tensor([-5.0]).cuda()
-    fog_density_log_param = torch.nn.Parameter(fog_density_log_buf, requires_grad=True)
-
-    initial_colours_buf = torch.ones(size=[len(frame_groups), 3]).cuda() * 0.5
-    initial_colours_param = torch.nn.Parameter(initial_colours_buf, requires_grad=True)
-
-    def objective_fn():
-        optimizer.zero_grad()
-
-        loss = 0
-        total_predictions = 0
-        for (i, frame_group) in enumerate(frame_groups):
-
-            for (frame, y, x) in frame_group:
-
-                # TODO: Codify this better.
-                colour_map = torch.from_numpy(frame.get_colour()).cuda()
-                colour_map = torch.flip(colour_map, dims=[0]) / 255.0
-
-                depth_map = torch.from_numpy(frame.get_depth()).cuda()
-
-                expected_colour = colour_map[y][x][:3]
-                true_depth = scene.proj_params.znear + depth_map[y][x][0] * (scene.proj_params.zfar - scene.proj_params.znear)
-                predicted_colour = fog(initial_colours_param[i], true_depth, fog_colour_param, fog_density_log_param)
-
-                loss += torch.nn.MSELoss()(predicted_colour, expected_colour)
-                total_predictions += 1
-
-        loss = loss / total_predictions
-        loss.backward()
-        print(loss.detach())
-
-        return loss
-    
-    optimizer = torch.optim.Adam([fog_colour_param, fog_density_log_param, initial_colours_param], lr=1e-1)
-
-    for t in range(0, 500):
-        loss = optimizer.step(closure=objective_fn)
-
-        # Project initial colour to be non-negative.
-        initial_colours_param.data = torch.maximum(initial_colours_param.data, torch.tensor(0).cuda())
-
-        if loss < 0.00015:
-            break
-
-    scene.fog_colour = fog_colour_param.data
-    scene.fog_density = torch.exp(fog_density_log_param.data)
-    print(f"Selected fog colour and density: {scene.fog_colour} and {scene.fog_density}")
-    pass
     
 
-def _depth_to_3D(depth_map, inv_projection, inv_view, znear, zfar, 
-        colour_map=None, pixel_coords_2D=None):
-    shape = depth_map.shape
+def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar, 
+        colour_map=None, pixel_coords_2D=None, uses_depth_map=True,
+        shape=None):
+    
+    if uses_depth_map and shape is None:
+        shape = depth_data.shape
+    elif not uses_depth_map and shape is None:
+        raise Exception("You must provide shape if not providing a depth map.")
 
     # You can optionally pass in pixel coordinates or they can be automatically
     # derived from the depth_map.
-    shape = depth_map.shape
     if pixel_coords_2D is None:
+        assert(uses_depth_map)
         y_coords, x_coords = torch.meshgrid(torch.arange(shape[0]).cuda(), torch.arange(shape[1]).cuda(), indexing='ij')
         x_coords = x_coords.flatten()
         y_coords = y_coords.flatten()
@@ -379,7 +380,10 @@ def _depth_to_3D(depth_map, inv_projection, inv_view, znear, zfar,
     y_coords = 2 * pixel_coords_2D[:,1] / shape[0] - 1 + 1 / shape[0]
     z_coords = torch.zeros_like(x_coords)
     projected_coords = torch.stack([x_coords, y_coords, z_coords, torch.ones_like(x_coords, dtype=torch.float32)], axis=-1)
-    depths = depth_map[pixel_coords_2D[:,1], pixel_coords_2D[:,0]][:,0]
+    if uses_depth_map:
+        depths = depth_data[pixel_coords_2D[:,1], pixel_coords_2D[:,0]][:,0]
+    else:
+        depths = depth_data
 
     # Calculate the view space coordinates
     view_coordinates = projected_coords @ inv_projection
@@ -391,7 +395,11 @@ def _depth_to_3D(depth_map, inv_projection, inv_view, znear, zfar,
     view_coordinates[:,3] = 1
 
     # Calculate the world space coordinates
-    point_homogeneous_world = view_coordinates @ inv_view
+    if len(inv_view.shape) == 2:
+        point_homogeneous_world = view_coordinates @ inv_view
+    else:
+        point_homogeneous_world = view_coordinates.reshape([-1, 1, 4]) @ inv_view
+        point_homogeneous_world = point_homogeneous_world.reshape([-1, 4])
 
     # Normalize to get the 3D coordinates
     point_3D = point_homogeneous_world[:,:3] / point_homogeneous_world[:,3].reshape([B, 1])

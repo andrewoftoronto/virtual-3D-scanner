@@ -16,7 +16,8 @@ class Frame:
     ''' Info about one frame of source data, including camera transform and 
         the colour/normal/depth maps.'''
     
-    def __init__(self, transform_frame: Optional[TFrame], colour_path: str, colour_map, depth_map, normal_map):
+    def __init__(self, index, transform_frame: Optional[TFrame], colour_path: str, colour_map, depth_map, normal_map):
+        self.index = index
         self.transform = transform_frame.transform_matrix if transform_frame is not None else None
         self.colour_path = colour_path
         self.colour_map = colour_map
@@ -54,21 +55,30 @@ class RawSceneData:
                 return frame
         raise Exception(f"Unable to find frame matching query: {frame_search_term}") 
 
+    def save_colours(self):
+        ''' Save all colour images. '''
+        for frame in self.frames:
+            image = Image.fromarray(frame.get_colour())
+            image.save(frame.colour_path)
 
-def load(transforms_path: str):
-    ''' Load transforms from the given path. '''
+
+def load(transforms_path: str, foggy: bool = False):
+    ''' Load scene data from the given folder, identified by its transforms 
+        file. '''
+    colour_folder = "images" if not foggy else "foggy-images"
 
     # Get the path of the folder containing the transforms file.
     base_path = os.path.dirname(os.path.abspath(transforms_path))
 
-    transforms = read_transforms(transforms_path)
+    transforms = read_transforms(transforms_path, foggy)
 
     frames = []
-    for tframe in transforms.frames:
-        colour = _load_map(tframe.file_path, 'images', base_path)
-        depth = _load_map(tframe.file_path, 'depth', base_path)
-        normal = _load_map(tframe.file_path, 'normal', base_path)
-        frame = Frame(tframe, tframe.file_path, colour, depth, normal)
+    for (index, tframe) in enumerate(transforms.frames):
+        image_file_path = os.path.join(base_path, tframe.file_path)
+        colour = _load_map(image_file_path, colour_folder, base_path)
+        depth = _load_map(image_file_path, 'depth', base_path)
+        normal = _load_map(image_file_path, 'normal', base_path)
+        frame = Frame(index, tframe, image_file_path, colour, depth, normal)
         frames.append(frame)
 
     extra_images_path = os.path.join(base_path, "extra-images")
@@ -76,12 +86,12 @@ def load(transforms_path: str):
     if os.path.exists(extra_images_path):
         extra_frame_names = os.listdir(extra_images_path)
     extra_frames = []
-    for name in extra_frame_names:
+    for (index, name) in enumerate(extra_frame_names):
         image_file_path = os.path.join(extra_images_path, name)
         colour = _load_map(image_file_path, 'extra-images', base_path)
         depth = _load_map(image_file_path, 'extra-depth', base_path)
         normal = _load_map(image_file_path, 'extra-normal', base_path)
-        frame = Frame(None, image_file_path, colour, depth, normal)
+        frame = Frame(index, None, image_file_path, colour, depth, normal)
         extra_frames.append(frame)
 
     scene_data = RawSceneData(transforms, frames, extra_frames)
@@ -93,17 +103,13 @@ def load(transforms_path: str):
     feature_data = load_matches(points_3D_path, points_2D_path)
     for (_id, frame_features) in feature_data.id_to_frame_features.items():
         frame_features.frame = scene_data.lookup(frame_features.frame)
-    feature_data.matches = [
-        [(scene_data.lookup(frame), x, y) for (frame, x, y) in point_matches]
-        for point_matches in feature_data.matches
-    ]
 
     scene_data.feature_data = feature_data
     return scene_data
 
 
 def _load_map(colour_path: str, type: str, base_path: str = None):
-    valid_types = ['images', 'depth', 'normal', 
+    valid_types = ['images', 'foggy-images', 'depth', 'normal', 
             'extra-images', 'extra-depth', 'extra-normal']
 
     if not os.path.isabs(colour_path):
@@ -115,8 +121,8 @@ def _load_map(colour_path: str, type: str, base_path: str = None):
         raise Exception(f"Invalid map type to load: {type}")
     
     path = os.path.abspath(path).replace('\\', '/')
-    if type != 'images' and type != 'extra-images':
-        path = path.replace('extra-images/', f"{type}/").replace('images/', f"{type}/")
+    if type != 'images' and type != 'extra-images' and type != 'foggy-images':
+        path = path.replace('extra-images/', f"{type}/").replace('foggy-images/', f"{type}/").replace('images/', f"{type}/")
 
     image = _load_image_without_extension(path)
     return image

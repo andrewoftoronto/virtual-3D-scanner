@@ -3,11 +3,11 @@ import numpy as np
 
 
 class FrameFeatures:
-    def __init__(self, id, frame, n_points):
+    def __init__(self, id, frame, coords_2D, point_3D_ids):
         self.id = id
         self.frame = frame
-        self.coords_2D = np.zeros(shape=[n_points, 2], dtype=float)
-        self.point_3D_ids = np.zeros(shape=[n_points], dtype=np.int64)
+        self.coords_2D = np.array(coords_2D, dtype=float)
+        self.point_3D_ids = np.array(point_3D_ids, dtype=np.int64)
 
 
 class PointData:
@@ -18,9 +18,21 @@ class PointData:
         self.coords = np.zeros(shape=[n_points, 3], dtype=float)
         self.errs = np.zeros(shape=[n_points], dtype=float)
 
-        # [[(frame, x, y), ...], ...]
+        # [[(frame_features_index, x, y), ...], ...]
         self.matches = []
 
+    def n_features(self) -> int:
+        ''' Gets the total number of features in this dataset. '''
+
+        return len(self.id_to_point_index)
+    
+    def n_frame_features(self) -> int:
+        ''' Gets the total number of 2D points in this dataset. '''
+
+        count = 0
+        for frame_features in self.id_to_frame_features.values():
+            count += len(frame_features.coords_2D)
+        return count
 
 class Point3D:
     def __init__(self, id, point_2Ds):
@@ -47,17 +59,18 @@ def load_matches(points_3D_file: str, points_2D_file: str) -> PointData:
             point_info_line = lines[i + 1]
             point_info_tokens = point_info_line.split(' ')
 
-            n_points = len(point_info_tokens) // 3
-            frame_features = FrameFeatures(id, frame_name, n_points)
-            id_to_frame_features[id] = frame_features
-
+            points_2D = []
+            points_3D_id = []
             for j in range(0, len(point_info_tokens), 3):
                 x = float(point_info_tokens[j])
                 y = float(point_info_tokens[j + 1])
                 point3D_id = int(point_info_tokens[j + 2])
-                
-                frame_features.coords_2D[j // 3] = [x, y]
-                frame_features.point_3D_ids[j // 3] = point3D_id
+
+                points_2D.append((x, y))
+                points_3D_id.append(point3D_id)
+
+            frame_features = FrameFeatures(id, frame_name, points_2D, points_3D_id)
+            id_to_frame_features[id] = frame_features
 
     # Load the 3D points file.
     with open(points_3D_file) as f:
@@ -88,13 +101,18 @@ def load_matches(points_3D_file: str, points_2D_file: str) -> PointData:
                 image_id = int(tokens[i])
                 point2D_idx = int(tokens[i + 1])
 
-                frame_features: FrameFeatures = id_to_frame_features[image_id]
-                frame = frame_features.frame
+                frame_features = id_to_frame_features[image_id]
                 x2D = frame_features.coords_2D[point2D_idx, 0]
                 y2D = frame_features.coords_2D[point2D_idx, 1]
-                point_2Ds.append((frame, x2D, y2D))
+                point_2Ds.append((frame_features, x2D, y2D))
 
             point_data.matches.append(point_2Ds)
+
+    # Eliminate 2D points with no corresponding 3D one.
+    for frame_features in point_data.id_to_frame_features.values():
+        filter_mask = frame_features.point_3D_ids != -1
+        frame_features.point_3D_ids = frame_features.point_3D_ids[filter_mask]
+        frame_features.coords_2D = frame_features.coords_2D[filter_mask]
 
     return point_data
 

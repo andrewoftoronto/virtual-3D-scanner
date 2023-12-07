@@ -28,7 +28,7 @@ class TransformsData:
         self.frames = frames
 
 
-def read_transforms(file_path: str) -> TransformsData:
+def read_transforms(file_path: str, foggy: bool = False) -> TransformsData:
     ''' Read the transforms file. '''
 
     # Read the JSON file into a Python dictionary
@@ -44,6 +44,10 @@ def read_transforms(file_path: str) -> TransformsData:
     for frame in dict_frames:
         frame_file_path = frame['file_path']
         transform_matrix = frame["transform_matrix"]
+
+        if foggy:
+            frame_file_path = frame_file_path.replace('images', 'foggy-images')
+
         frames.append(Frame(frame_file_path, transform_matrix))
 
     return TransformsData(params, frames)
