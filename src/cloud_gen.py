@@ -4,40 +4,55 @@ import torch
 import numpy as np
 from .source_loader import RawSceneData
 
-# List of groups where each frame in the group includes a pixel that should 
-# occupy the same 3D spatial location.
-# Each such frame entry is (name, Y pixel, X pixel). Name can be a substring 
-# of the colour map file name.
-'''depth_inference_groups = [
-    [
-        ('054', 1440 - 559, 2250),
-        ('058', 1440 - 182, 1160)
-    ],
-    [
-        ('069', 1440 - 752, 1418),
-        ('066', 1440 - 743, 1390)
-    ]
-]'''
-ground_truth_frames = ['066', '069']
-orientation_constraints = [
-    ['066', '067', '068', '069']
-]
-lineup_constraints = [
-    ['066', '067', '068', '069']
-]
+
+class ColinearConstraint:
+    def __init__(self, parent_keyword: str, 
+                 direction, 
+                 children: List[str|Tuple[str, bool]]):
+        self.parent = parent_keyword
+        self.direction = np.array(direction, dtype=np.float32)
+        self.children = children
+
+    def resolve_names(self, scene_data: RawSceneData):
+        ''' Resolve name keywords into actual frame objects. '''
+
+        self.parent = scene_data.lookup(self.parent)
+
+        # Resolve children. Each may be a tuple or just name.
+        for (i, child) in enumerate(self.children):
+            if isinstance(child, tuple):
+                keyword, learnable_dist = child[0], child[1]
+            else:
+                keyword, learnable_dist = child, True
+            frame = scene_data.lookup(keyword)
+            self.children[i] = (frame, learnable_dist)
+
+
+class CameraInferenceContext:
+
+    def __init__(self, scene_data: RawSceneData, orientation_constraints, 
+            colinear_constraints: List[ColinearConstraint]):
+        self.scene_data: RawSceneData = scene_data
+        self.orientation_constraints = orientation_constraints
+        self.colinear_constraints = colinear_constraints
+
+        # By default, assume all cameras are unconstrained and that their
+        # translation vector is a learnable parameter.
+        self.learnable_vector_bitmap = np.ones(shape=len(scene_data.frames))
+
+        self.cam_to_orientation_source = None
+        self.orientation_params = None
+
+    def get_orientation(self, camera_index):
+        source_index = self.cam_to_orientation_source[camera_index]
+        params = self.orientation_params[source_index] 
+        return make_rotation(params.unsqueeze(0))[0]
 
 def cloud_gen(scene: RawSceneData):
     ''' Generate a point cloud from the given raw scene data. '''
 
     znear = 0.0001
     zfar = 10000
-
-    '''y_angle = 65 / 180 * np.pi
-    scene.proj_params.fl_y = y_angle
-    focal_length = scene.proj_params.h / (2 * np.tan(y_angle / 2))
-    scene.proj_params.fl_x = 2 * np.arctan(scene.proj_params.w / (2 * focal_length))
-    scene.proj_params.fl_x = np.float32(scene.proj_params.fl_x)
-    scene.proj_params.fl_y = np.float32(scene.proj_params.fl_y)'''
 
     fl_x = scene.proj_params.fl_x
     fl_y = scene.proj_params.fl_y
@@ -97,34 +112,206 @@ def cloud_gen(scene: RawSceneData):
     return coords, colours, normals
 
 
-def make_rotation(quaternions):
-    ''' Make rotation matrix tensors from quaternion tensors.
+def apply_orientation_constraints(context: CameraInferenceContext):
+    n_frames = len(context.scene_data.frames)
 
-        Return [batch_size, 3, 3] array of 3x3 rotation matrices. 
-    '''
-    assert(len(quaternions.shape) == 2)
-    batch_size = quaternions.shape[0]
+    # Identifies frames participating in a constraint so we can detect invalid
+    # data.
+    constrained_orientation_bitmap = np.zeros(shape=[n_frames], dtype=bool)
 
-    # Ensure unit quaternion.
-    quaternions = quaternions / torch.norm(quaternions, dim=1).unsqueeze(-1)
+    for orientation_constraint in context.orientation_constraints:
+        for (i, member_keyword) in enumerate(orientation_constraint):
+            frame = context.scene_data.lookup(member_keyword)
+            orientation_constraint[i] = frame
 
-    # Convert quaternions to rotation matrices
-    x, y, z, w = (quaternions[:, 0:1], quaternions[:, 1:2], 
-            quaternions[:, 2:3], quaternions[:, 3:4])
-    r00 = 1 - 2*(y**2 + z**2)
-    r01 = 2*(x*y - w*z)
-    r02 = 2*(x*z + w*y)
-    r10 = 2*(x*y + w*z)
-    r11 = 1 - 2*(x**2 + z**2)
-    r12 = 2*(y*z - w*x)
-    r20 = 2*(x*z - w*y)
-    r21 = 2*(y*z + w*x)
-    r22 = 1 - 2*(x**2 + y**2)
-    rotation_matrices = torch.concat(
-        (r00, r01, r02, r10, r11, r12, r20, r21, r22), dim=1
+            if constrained_orientation_bitmap[frame.index] != 0:
+                raise Exception(f"Frame {frame.index} participates in multiple orientation constraints.")
+            constrained_orientation_bitmap[frame.index] = 1
+        
+    # Frames not in any orientation constraint plus number of constraints.
+    n_unique_orientations = (
+        (n_frames - np.sum(constrained_orientation_bitmap)) +
+        len(context.orientation_constraints)
     )
 
-    return rotation_matrices.reshape([batch_size, 3, 3])
+    # Map cameras to unique orientation sources.
+    # First map unconstrained frames, then constrained ones.
+    cam_to_orientation_source = np.zeros(shape=[n_frames], dtype=np.int64)
+    unique_orientations = np.zeros(shape=[n_unique_orientations, 4], dtype=np.float32)
+    orient_source_i = 0
+    for frame in context.scene_data.frames:
+        if constrained_orientation_bitmap[frame.index]:
+            continue
+        cam_to_orientation_source[frame.index] = orient_source_i
+        unique_orientations[orient_source_i] = frame.transform[3:,3:]
+        orient_source_i += 1
+    for constraint in context.orientation_constraints:
+        source_index = orient_source_i
+        orient_source_i += 1
+
+        unique_orientations[source_index] = constraint[0].transform[3:,3:]
+        for frame in constraint:
+            cam_to_orientation_source[frame.index] = source_index 
+
+    context.cam_to_orientation_source = torch.from_numpy(cam_to_orientation_source).cuda()
+    context.orientation_params = torch.nn.Parameter(torch.from_numpy(unique_orientations)).cuda()
+
+def apply_colinear_constraints(context: CameraInferenceContext):
+    n_frames = len(context.scene_data.frames)
+
+    # Every co-linear constraint has one frame that is considered the parent;
+    # we will create a sort of traversable tree that can resolve ancestry.
+    # Along the way, we'll record the colinear direction vector that each child
+    # is located along.
+    frame_to_parent = -np.ones(shape=[n_frames], dtype=np.int64)
+    learnable_dist_bitmap = np.zeros(shape=[n_frames], dtype=bool)
+    camera_vectors = np.zeros(shape=[n_frames, 3])
+    for constraint in context.colinear_constraints:
+        constraint.resolve_names(context.scene_data)
+        parent_index = constraint.parent.index
+
+        for child_data in constraint.children:
+
+            # After resolution, all of the children in the constraint are tuples.
+            child, learnable_dist = child_data
+
+            old_parent_index = frame_to_parent[child.index]
+            if old_parent_index != -1:
+                raise Exception(f"Child {child.index} already has a parent: {old_parent_index}")
+            
+            frame_to_parent[child.index] = parent_index
+
+            camera_vectors[child.index] = constraint.direction
+            learnable_dist_bitmap[child.index] = learnable_dist
+            context.learnable_vector_bitmap[child.index] = 0
+
+    # For root frames, record translation from origin to reach the camera pose.
+    for frame in context.scene_data.frames:
+        parent_index = frame_to_parent[frame.index]
+        if parent_index != -1:
+            continue
+
+        camera_vectors[frame.index] = frame.get_position()
+
+    # We will resolve the root of every frame using dynamic programming DFS.
+    # Meanwhile, we'll also populate the matrix whose columns indicate all the 
+    # vectors used to locate a frame (ancestors + frame's unique vector).
+    n_roots = 0
+    frame_to_root = -np.ones(n_frames, dtype=np.int64)
+    vectors_to_frames = np.zeros(shape=[n_frames, n_frames], dtype=np.float32)
+    modeled_camera_translations = np.zeros(shape=[n_frames, 3], dtype=np.float32)
+    dists = np.ones(shape=[n_frames], dtype=np.float32)
+    for frame in context.scene_data.frames:
+
+        # stack: tracks frames being explored.
+        # root_index: set to index of the root when found.
+        # parent_col_index: set to index of the matrix column of the last
+        #   memoized ancestor. Only set if the root has already been explored.
+        current_index = frame.index
+        stack = []
+        root_index = None
+        parent_col_index = None
+        while True:
+
+            # Root already identified by current frame.
+            if frame_to_root[current_index] != -1:
+                root_index = frame_to_root[current_index]
+                parent_col_index = current_index
+                break
+
+            stack.append(current_index)
+            if current_index in stack[:-1]:
+                raise Exception(f"Colinear constraint cycle detected: [{stack}].")
+
+            if frame_to_parent[current_index] == -1:
+
+                # No parent, so current frame must be the root.
+                root_index = current_index
+                n_roots += 1
+                break
+            else:
+
+                # Recurse to identify root.
+                current_index = frame_to_parent[current_index]
+
+        # Set up column to be used for updating every frame in the stack and
+        # obtain cumulative translation by any already-computed ancestors.
+        if parent_col_index is not None:
+            column = vectors_to_frames[:, parent_col_index].copy()
+            accum_translation = modeled_camera_translations[parent_col_index]
+        else:
+            column = np.zeros(shape=[n_frames], dtype=np.float32)
+            accum_translation = np.array([0, 0, 0])
+
+        # Resolve roots and update matrix and other data for every frame.
+        for frame_index in reversed(stack):
+            frame_to_root[frame_index] = root_index
+ 
+            if parent_col_index is None:
+
+                # This is a root so dist scalar is 1.
+                dists[frame_index] = 1
+                accum_translation = camera_vectors[frame.index]
+            else:
+
+                # This is a colinear constraint child. Its dist scalar is computed
+                # by projecting its prior-known position onto the colinear line
+                # defined by its parent.
+                prior_cam = frame.get_position()
+                transform = context.get_orientation(parent_col_index).detach().cpu().numpy()
+                direction = camera_vectors[frame_index] @ transform
+                dist = np.dot(prior_cam - accum_translation, direction)
+                dists[frame_index] = dist
+                accum_translation += dist * direction
+            modeled_camera_translations[frame_index] = accum_translation
+
+            # Update the matrix. Each column specifies to use the frame's own
+            # vector and the vectors of any and all ancestors.
+            column[frame_index] = 1
+            vectors_to_frames[:, frame_index] = column
+
+            parent_col_index = frame_index
+    assert(-1 not in frame_to_root)
+
+    # Set up vector and dist sources.
+    # Vectors can either be fixed, learnable or derived from parent frame (colinear).
+    # Dists can either be fixed or learnable.
+    n_learnable_roots = np.sum(context.learnable_vector_bitmap).astype(np.int64)
+    n_colinear_vectors = n_frames - n_roots
+    n_learnable_dists = np.sum(learnable_dist_bitmap).astype(np.int64)
+    context.vector_params = torch.nn.Parameter(torch.zeros(size=[n_learnable_roots, 3]), requires_grad=True)
+    context.dist_params = torch.nn.Parameter(torch.zeros(size=[n_learnable_dists]), requires_grad=True)
+    context.learnable_vectors = torch.zeros(size=[n_learnable_roots], dtype=torch.int64)
+    context.colinear_vectors = torch.zeros(size=[n_colinear_vectors, 2], dtype=torch.int64)
+    context.learnable_dists = torch.zeros(size=[n_learnable_dists], dtype=torch.int64)
+
+    # Assign learnable params and colinear vector sources.
+    learnable_vector_i = 0
+    colinear_vector_i = 0
+    learnable_dist_i = 0
+    for (i, frame) in enumerate(context.scene_data.frames):
+        
+        if context.learnable_vector_bitmap[i]:
+            context.learnable_vectors[learnable_vector_i] = i 
+            context.vector_params.data[learnable_vector_i] = torch.from_numpy(camera_vectors[i]).cuda() 
+            learnable_vector_i += 1
+        elif frame_to_parent[i] != -1:
+            parent_index = frame_to_parent[i]
+            context.colinear_vectors[colinear_vector_i] = torch.tensor([i, parent_index]).cuda()
+            colinear_vector_i += 1
+
+        if learnable_dist_bitmap[i]:
+            context.learnable_dists[learnable_dist_i] = i
+            context.dist_params.data[learnable_dist_i] = float(dists[i])
+            learnable_dist_i += 1
+
+    # These are the default values for the camera vectors and 
+    # vector dist tensors. For each solver iteration, these tensors are copied
+    # and values that aren't fixed are overridden.
+    context.default_camera_vectors = torch.from_numpy(camera_vectors).cuda()
+    context.default_dists = torch.from_numpy(dists).cuda()
+
+    pass
 
 
 def _infer_zparams(scene: RawSceneData):
@@ -139,6 +326,19 @@ def _infer_zparams(scene: RawSceneData):
     inv_proj = _inverse_projection_matrix(w, h, fl_x, fl_y, 
             torch.tensor(0.1, dtype=torch.float32), 
             torch.tensor(1000,  dtype=torch.float32)).T.cuda()
+
+    # Create matrix representing cameras that participate in co-linear 
+    # constraints.
+    orientation_constraints = [
+        ['066', '067', '068', '069']
+    ]
+    colinear_constraints = [
+        ColinearConstraint('066', (0, 0, 1), [('067', False), '068', '069'])
+    ]
+    context = CameraInferenceContext(scene, orientation_constraints, 
+            colinear_constraints)
+    apply_orientation_constraints(context)
+    apply_colinear_constraints(context)
 
     # Camera translations and rotations grouped in a single tensor each.
     n_frames = len(scene.frames)
@@ -283,7 +483,7 @@ def _infer_zparams(scene: RawSceneData):
 
     cam_param.requires_grad = True
     cam_orientation_param.requires_grad = True
-    for t in range(0, 0 * 6000):
+    for t in range(0, 6000):
 
         if t == 0:
             for param_group in optimizer.param_groups:
@@ -451,3 +651,33 @@ def _inverse_projection_matrix(width, height, camera_angle_x, camera_angle_y, zn
     ]).reshape((4, 4))
 
     return inv_projection_matrix
+
+
+def make_rotation(quaternions):
+    ''' Make rotation matrix tensors from quaternion tensors.
+
+        Return [batch_size, 3, 3] array of 3x3 rotation matrices. 
+    '''
+    assert(len(quaternions.shape) == 2)
+    batch_size = quaternions.shape[0]
+
+    # Ensure unit quaternion.
+    quaternions = quaternions / torch.norm(quaternions, dim=1).unsqueeze(-1)
+
+    # Convert quaternions to rotation matrices
+    x, y, z, w = (quaternions[:, 0:1], quaternions[:, 1:2], 
+            quaternions[:, 2:3], quaternions[:, 3:4])
+    r00 = 1 - 2*(y**2 + z**2)
+    r01 = 2*(x*y - w*z)
+    r02 = 2*(x*z + w*y)
+    r10 = 2*(x*y + w*z)
+    r11 = 1 - 2*(x**2 + z**2)
+    r12 = 2*(y*z - w*x)
+    r20 = 2*(x*z - w*y)
+    r21 = 2*(y*z + w*x)
+    r22 = 1 - 2*(x**2 + y**2)
+    rotation_matrices = torch.concat(
+        (r00, r01, r02, r10, r11, r12, r20, r21, r22), dim=1
+    )
+
+    return rotation_matrices.reshape([batch_size, 3, 3])

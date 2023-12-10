@@ -26,6 +26,9 @@ class Frame:
         if "085" in colour_path:
             print("Loaded 85")
 
+    def get_position(self):
+        return self.transform[3,:3]
+
     def get_colour(self):
         if isinstance(self.colour_map, DelayLoadMap):
             self.colour_map = self.colour_map.load()
