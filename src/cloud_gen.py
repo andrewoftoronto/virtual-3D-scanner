@@ -3,6 +3,7 @@ from itertools import chain
 import torch
 import numpy as np
 from .source_loader import RawSceneData
+import open3d as o3d
 
 
 class ColinearConstraint:
@@ -55,9 +56,6 @@ class CameraInferenceContext:
 def cloud_gen(scene: RawSceneData):
     ''' Generate a point cloud from the given raw scene data. '''
 
-    znear = 0.0001
-    zfar = 10000
-
     fl_x = scene.proj_params.fl_x
     fl_y = scene.proj_params.fl_y
     cx = scene.proj_params.cx
@@ -66,20 +64,18 @@ def cloud_gen(scene: RawSceneData):
     h = scene.proj_params.h
 
     # Infer zparams using images that point to the same place.
-    _infer_zparams(scene)
+    #_infer_zparams(scene)
+    scene.proj_params.znear = 0.07
+    scene.proj_params.zfar = 206
 
     inv = _inverse_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear, dtype=torch.float32), torch.tensor(scene.proj_params.zfar, dtype=torch.float32)).cuda().T
 
     coords = np.zeros([0,3], dtype=np.float64)
     colours = np.zeros([0,3], dtype=np.float64)
     normals = np.zeros([0,3], dtype=np.float64)
+    capture_clouds = []
+    prev_cloud = None
     for (i, frame) in enumerate(scene.frames):
-        #onlys = ['54', '58']
-        onlys = ['54', '58', '62', '66', '69', '85']
-        if not any([only in frame.colour_path for only in onlys]):
-            continue
-        #if i >= 20:
-        #    continue
 
         transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
         inv_view = transform_matrix
@@ -91,28 +87,79 @@ def cloud_gen(scene: RawSceneData):
         colour_map = torch.flip(colour_map, dims=[0])
         colour_map = colour_map[:,:,:3] / 255
 
-        full_depths = scene.proj_params.znear + (scene.proj_params.zfar - scene.proj_params.znear) * depth_map
-        #colour_map = unfog(colour_map, full_depths, scene.fog_colour, scene.fog_density)
-
         frame_coords, frame_colours, tex = _depth_to_3D(depth_map, inv, inv_view, scene.proj_params.znear, scene.proj_params.zfar, colour_map)
+        n_points = len(frame_coords)
 
         # First we must convert out of RGB and into screen space normals. Then,
         # transform screen space normals into world space.
-        frame_normals = torch.from_numpy(frame.get_normal()).cuda().reshape([-1, 3])
-        frame_normals = 2 * (frame_normals - 0.5)
-        frame_normals[:,1] = -frame_normals[:,1]
-        frame_normals[:,0] = -frame_normals[:,0]
+        '''frame_normals = torch.from_numpy(frame.get_normal()).cuda().reshape([-1, 3])
+        frame_normals[:,0] = -2 * (frame_normals[:, 0] - 0.5)
+        frame_normals[:,1] = -2 * (frame_normals[:, 1] - 0.5)
+        frame_normals[:,2] = 2 * (frame_normals[:, 2] - 0.5)
+        homogenous_frame_normals = torch.concat((frame_normals, torch.zeros(size=[n_points, 1]).cuda()), axis=1)
 
-        # Camera transform is rigid, so no need to inverse-transpose.
-        normal_transform = inv_view[:3,:3]
-        frame_normals = torch.matmul(frame_normals, normal_transform)
-        frame_normals = frame_normals / torch.linalg.norm(frame_normals, dim=1).unsqueeze(-1)
+        homogenous_frame_coords = torch.concat((frame_coords, torch.ones(size=[n_points, 1]).cuda()), axis=1)
+        homogenous_view_coords = torch.matmul(homogenous_frame_coords, view)
+        homogenous_screen_coords = torch.matmul(homogenous_view_coords, proj)
+        homogenous_screen_coords = homogenous_screen_coords / homogenous_screen_coords[:,3].unsqueeze(-1)
+        n_h_screen_coords = homogenous_screen_coords + homogenous_frame_normals * 1e-6
+        n_h_view_coords = torch.matmul(n_h_screen_coords, inv)
+        n_h_view_coords = n_h_view_coords / n_h_view_coords[:,3].unsqueeze(-1)
+        n_h_world_coords = torch.matmul(n_h_view_coords, inv_view)
+        frame_normals = n_h_world_coords[:,:3] - frame_coords
+        frame_normals = frame_normals / torch.norm(frame_normals, dim=1).unsqueeze(-1)'''
 
-        #frame_colours = tex
+        #homogenous_frame_normals = torch.concat((frame_normals, torch.zeros(size=[n_points, 1]).cuda()), axis=1)
+        #homogenous_frame_normals = torch.matmul(homogenous_frame_normals, inv)
+        #frame_normals =  homogenous_frame_normals[:,:3] / homogenous_frame_normals[:,3].unsqueeze(-1)
+        #frame_normals = frame_normals / torch.linalg.norm(frame_normals, dim=1).unsqueeze(-1)
+        #frame_normals = frame_normals.matmul(inv_view[:3,:3])
 
-        coords = np.concatenate((coords, frame_coords.detach().to(torch.float64).cpu()), axis=0)
-        colours = np.concatenate((colours, frame_colours.detach().to(torch.float64).cpu()), axis=0)
-        normals = np.concatenate((normals, frame_normals.detach().to(torch.float64).cpu()), axis=0)
+        shape = frame.get_depth().shape
+        c = frame_coords.reshape([shape[0], shape[1], 3])
+        t1 = c[1:,:-1] - c[:-1,:-1]
+        t2 = c[:-1,1:] - c[:-1,:-1]
+        n = torch.cross(t2, t1, dim=2)
+        n = n / torch.norm(n, dim=2).unsqueeze(-1)
+
+        frame_coords = c[:-1,:-1]
+        frame_normals = n[:-1,:-1]
+        frame_colours = frame_colours.reshape([shape[0], shape[1], 3])[:-1,:-1]
+
+        frame_coords = frame_coords.reshape([-1, 3])
+        frame_normals = frame_normals.reshape([-1, 3])
+        frame_colours = frame_colours.reshape([-1, 3])
+
+        '''frame_normals = torch.from_numpy(frame.get_normal()).cuda().reshape([-1, 3])
+        frame_normals[:,0] = -2 * (frame_normals[:, 0] - 0.5)
+        frame_normals[:,1] = -2 * (frame_normals[:, 1] - 0.5)
+        frame_normals[:,2] = 2 * (frame_normals[:, 2] - 0.5)
+        homogenous_frame_normals = torch.concat((frame_normals, torch.zeros(size=[n_points, 1]).cuda()), axis=1)'''
+
+        #pcd = o3d.geometry.PointCloud()
+        #pcd.points = o3d.utility.Vector3dVector(frame_coords.detach().cpu().numpy())
+        #pcd.normals = o3d.utility.Vector3dVector(frame_normals.detach().cpu().numpy())
+        #pcd.colors = o3d.utility.Vector3dVector(frame_colours.detach().cpu().numpy())
+        '''if prev_cloud is not None:
+            icp_result = o3d.pipelines.registration.registration_icp(
+                pcd, prev_cloud,
+                max_correspondence_distance=0.05,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200))
+            pcd.transform(icp_result.transformation)
+        prev_cloud = pcd'''
+
+        onlys = ['000', '006', '010', '014', '017', '024']
+        if any([only in frame.colour_path for only in onlys]):
+            #capture_clouds.append(pcd)
+
+            coords = np.concatenate((coords, frame_coords.detach().to(torch.float64).cpu()), axis=0)
+            colours = np.concatenate((colours, frame_colours.detach().to(torch.float64).cpu()), axis=0)
+            normals = np.concatenate((normals, frame_normals.detach().to(torch.float64).cpu()), axis=0)
+        
+    #o3d.visualization.draw_geometries(capture_clouds)
+    #exit(0)
+
     return coords, colours, normals
 
 
@@ -339,21 +386,28 @@ def _infer_zparams(scene: RawSceneData):
             torch.tensor(0.1, dtype=torch.float32), 
             torch.tensor(1000,  dtype=torch.float32)).T.cuda()
 
-    f1 = scene.lookup('067')
-    f2 = scene.lookup('066')
+    f1 = scene.lookup('003')
+    f2 = scene.lookup('006')
     d1 = f1.get_depth()[720, 1280, 0]
     d2 = f2.get_depth()[720, 1280, 0]
     dist = np.linalg.norm(f1.get_position() - f2.get_position())
     slope = dist / np.abs(d2 - d1)
 
+    f1 = scene.lookup('004')
+    f2 = scene.lookup('005')
+    d1 = f1.get_depth()[720, 1280, 0]
+    d2 = f2.get_depth()[720, 1280, 0]
+    dist = np.linalg.norm(f1.get_position() - f2.get_position())
+    slope2 = dist / np.abs(d2 - d1)
+
     fixed_pos_constraints = [
-        '066'
+        '003'
     ]
     orientation_constraints = [
-        ['066', '067', '068', '069']
+       # ['003', '004', '005', '006']
     ]
     colinear_constraints = [
-        ColinearConstraint('066', (0, 0, 1), [('067', False), '068', '069'])
+       #    ColinearConstraint('003', (0, 0, 1), [('006',  False)])
     ]
     context = CameraInferenceContext(
         scene, 
@@ -365,7 +419,7 @@ def _infer_zparams(scene: RawSceneData):
     apply_orientation_constraints(context)
     apply_colinear_constraints(context)
 
-    scene.feature_data.filter_by_err(10)
+    #scene.feature_data.filter_by_err(10)
 
     # Create tensors for: 
     # - Number of frames that contain each feature.
@@ -425,7 +479,8 @@ def _infer_zparams(scene: RawSceneData):
         camera_vectors[context.learnable_vectors] = context.vector_params
         colinear_indices = context.colinear_vectors[:, 0]
         colinear_source_cams = context.colinear_vectors[:, 1]
-        camera_vectors[colinear_indices] = (context.default_camera_vectors[colinear_indices].view([1, 3, 3]) @ total_transforms[colinear_source_cams, :3, :3])[0]
+        if len(colinear_indices) > 0:
+            camera_vectors[colinear_indices] = (context.default_camera_vectors[colinear_indices].view([-1, 1, 3]) @ total_transforms[colinear_source_cams, :3, :3])[0]
         total_transforms[:, 3, 0] = (dists.view([1, -1]) * camera_vectors[:, 0].view([1, -1])) @ context.vectors_to_frame_matrix
         total_transforms[:, 3, 1] = (dists.view([1, -1]) * camera_vectors[:, 1].view([1, -1])) @ context.vectors_to_frame_matrix
         total_transforms[:, 3, 2] = (dists.view([1, -1]) * camera_vectors[:, 2].view([1, -1])) @ context.vectors_to_frame_matrix
@@ -467,7 +522,8 @@ def _infer_zparams(scene: RawSceneData):
         #print(loss.detach())
         return loss
     
-    optimizer = torch.optim.Adam([zstats_param, context.orientation_params, context.vector_params, context.dist_params], lr=2e-1)
+    #optimizer = torch.optim.Adam([zstats_param, context.orientation_params, context.vector_params, context.dist_params], lr=2e-1)
+    optimizer = torch.optim.Adam([zstats_param], lr=2e-1)
 
     '''cam_param.requires_grad = False
     cam_orientation_param.requires_grad = False
@@ -483,7 +539,7 @@ def _infer_zparams(scene: RawSceneData):
 
     cam_param.requires_grad = True
     cam_orientation_param.requires_grad = True'''
-    for t in range(0, 6000):
+    for t in range(0, 100):
 
         if t == 0:
             for param_group in optimizer.param_groups:
@@ -499,10 +555,12 @@ def _infer_zparams(scene: RawSceneData):
         if t % 10 == 0:
             print(f"Step {t}: ", loss)
 
-
     zstats = torch.exp(zstats_param)
     scene.proj_params.znear = float(zstats[0].detach())
-    scene.proj_params.zfar = slope + float(zstats[0].detach())
+    scene.proj_params.zfar = slope + scene.proj_params.znear 
+
+    scene.proj_params.znear = 0.07
+    scene.proj_params.zfar = slope + scene.proj_params.zfar
     print(f"Selected znear and zfar: {scene.proj_params.znear} and {scene.proj_params.zfar}")
     
     # Permanently apply our adjusted camera positions.
@@ -511,8 +569,8 @@ def _infer_zparams(scene: RawSceneData):
     #    frame.transform[3:,:3] = frame.transform[3:,:3] + cam_param[cam_idx].detach().cpu().numpy()
 
     transforms = compute_transforms()
-    for (cam_idx, frame) in enumerate(scene.frames):
-        frame.transform = transforms[cam_idx].detach().cpu().numpy()
+    #for (cam_idx, frame) in enumerate(scene.frames):
+    #    frame.transform = transforms[cam_idx].detach().cpu().numpy()
 
     #raise Exception("TODO: Apply params to transforms.")
     pass
@@ -587,7 +645,7 @@ def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y
 
     projection_matrix = torch.tensor([
         a, 0, 0, 0,
-        0, b, 0,
+        0, b, 0, 0,
         0, 0, -(zfar + znear) / (zfar - znear), -(2 * zfar * znear) / (zfar - znear),
         0, 0, -1, 0
     ]).reshape((4, 4))

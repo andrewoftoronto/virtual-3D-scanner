@@ -3,7 +3,7 @@ import os
 import numpy as np
 import cv2
 from PIL import Image
-from .transforms import TransformsData, Frame as TFrame, read_transforms
+from .transforms import ProjectionParameters, Frame as TFrame, read_transforms
 from .matching.match_loader import load_matches, PointData
 
 class DelayLoadMap:
@@ -29,6 +29,9 @@ class Frame:
     def get_position(self):
         return self.transform[3,:3]
 
+    def get_base_name(self):
+        return os.path.split(self.colour_path)
+
     def get_colour(self):
         if isinstance(self.colour_map, DelayLoadMap):
             self.colour_map = self.colour_map.load()
@@ -46,8 +49,8 @@ class Frame:
 class RawSceneData:
     ''' Collection of all source data used to describe a scene. '''
 
-    def __init__(self, transform_scene_data: TransformsData, frames: List[Frame], extra_frames: List[Frame]):
-        self.proj_params = transform_scene_data.parameters
+    def __init__(self, transform_scene_data: ProjectionParameters, frames: List[Frame], extra_frames: List[Frame]):
+        self.proj_params = transform_scene_data
         self.frames = frames
         self.extra_frames = extra_frames
         self.feature_data : PointData = None
@@ -84,6 +87,12 @@ def load(transforms_path: str, foggy: bool = False):
         frame = Frame(index, tframe, image_file_path, colour, depth, normal)
         frames.append(frame)
 
+    transform_parameters = transforms.parameters
+    del transforms
+
+    # Sort frames by name.
+    #frames.sort(key=lambda f: f.get_base_name())
+
     extra_images_path = os.path.join(base_path, "extra-images")
     extra_frame_names = []
     if os.path.exists(extra_images_path):
@@ -97,7 +106,7 @@ def load(transforms_path: str, foggy: bool = False):
         frame = Frame(index, None, image_file_path, colour, depth, normal)
         extra_frames.append(frame)
 
-    scene_data = RawSceneData(transforms, frames, extra_frames)
+    scene_data = RawSceneData(transform_parameters, frames, extra_frames)
 
     # Load 3D feature matches. We also correct each image to have the actual
     # Frame rather than just the name of the image.
