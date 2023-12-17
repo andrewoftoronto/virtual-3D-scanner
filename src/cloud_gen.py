@@ -150,8 +150,9 @@ def cloud_gen(scene: RawSceneData):
             pcd.transform(icp_result.transformation)
         prev_cloud = pcd'''
 
-        onlys = ['000', '009']
-        if any([only in frame.colour_path for only in onlys]):
+        onlys = ['000', '001', '009', '017', '002', '004', '023']
+        #if any([only in frame.colour_path for only in onlys]):
+        if True:
             #capture_clouds.append(pcd)
 
             coords = np.concatenate((coords, frame_coords.detach().to(torch.float64).cpu()), axis=0)
