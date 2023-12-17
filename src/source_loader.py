@@ -28,6 +28,8 @@ class Frame:
 
     def get_position(self):
         return self.transform[3,:3]
+    def get_forward(self):
+        return self.transform[2,:3]
 
     def get_base_name(self):
         return os.path.split(self.colour_path)
@@ -83,7 +85,7 @@ def load(transforms_path: str, foggy: bool = False):
         image_file_path = os.path.join(base_path, tframe.file_path)
         colour = _load_map(image_file_path, colour_folder, base_path)
         depth = _load_map(image_file_path, 'depth', base_path)
-        normal = _load_map(image_file_path, 'normal', base_path)
+        normal = None #_load_map(image_file_path, 'normal', base_path)
         frame = Frame(index, tframe, image_file_path, colour, depth, normal)
         frames.append(frame)
 

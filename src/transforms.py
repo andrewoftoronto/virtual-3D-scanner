@@ -19,7 +19,7 @@ class Frame:
 
         # The given matrix is useful for the typical opengl multiplication 
         # order, but this project uses the opposite convention.
-        self.transform_matrix = np.array(transform_matrix).T
+        self.transform_matrix = transform_matrix
 
 
 class TransformsData:
@@ -44,6 +44,15 @@ def read_transforms(file_path: str, foggy: bool = False) -> TransformsData:
     for frame in dict_frames:
         frame_file_path = frame['file_path']
         transform_matrix = frame["transform_matrix"]
+
+        r = np.array([
+            [1, 0, 0, 0],
+            [0, -1.0, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]])
+
+        transform_matrix = np.array(transform_matrix).T
+        transform_matrix = np.matmul(r, transform_matrix)
 
         if foggy:
             frame_file_path = frame_file_path.replace('images', 'foggy-images')

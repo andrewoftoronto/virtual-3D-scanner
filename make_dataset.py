@@ -41,7 +41,7 @@ def main():
         normal_file_name = f"{base_name} NormalMap.exr"
         old_normal = os.path.join(source_folder, normal_file_name)
         new_normal = os.path.join(dest_folder, "normal/", f"{new_base_name}.exr")
-        mv(old_normal, new_normal)
+        #mv(old_normal, new_normal)
 
 
 if __name__ == '__main__':

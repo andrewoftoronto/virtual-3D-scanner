@@ -65,10 +65,11 @@ def cloud_gen(scene: RawSceneData):
 
     # Infer zparams using images that point to the same place.
     #_infer_zparams(scene)
-    scene.proj_params.znear = 0.07
-    scene.proj_params.zfar = 206
+    scene.proj_params.zfar = 999999999
+    scene.proj_params.znear = 0.69
 
-    inv = _inverse_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear, dtype=torch.float32), torch.tensor(scene.proj_params.zfar, dtype=torch.float32)).cuda().T
+    proj = _perspective_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear, dtype=torch.float32), torch.tensor(scene.proj_params.zfar, dtype=torch.float32)).cuda().T
+    inv = torch.linalg.inv(proj)
 
     coords = np.zeros([0,3], dtype=np.float64)
     colours = np.zeros([0,3], dtype=np.float64)
@@ -81,10 +82,10 @@ def cloud_gen(scene: RawSceneData):
         inv_view = transform_matrix
 
         depth_map = torch.from_numpy(frame.get_depth()).cuda()
+        #depth_map = torch.flip(depth_map, dims=[0])
 
         # TODO: Codify this better.
         colour_map = torch.from_numpy(frame.get_colour()).cuda()
-        colour_map = torch.flip(colour_map, dims=[0])
         colour_map = colour_map[:,:,:3] / 255
 
         frame_coords, frame_colours, tex = _depth_to_3D(depth_map, inv, inv_view, scene.proj_params.znear, scene.proj_params.zfar, colour_map)
@@ -149,7 +150,7 @@ def cloud_gen(scene: RawSceneData):
             pcd.transform(icp_result.transformation)
         prev_cloud = pcd'''
 
-        onlys = ['000', '006', '010', '014', '017', '024']
+        onlys = ['000', '009']
         if any([only in frame.colour_path for only in onlys]):
             #capture_clouds.append(pcd)
 
@@ -597,25 +598,27 @@ def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar,
     else:
         B = len(pixel_coords_2D)
 
-    # Create homogenous normalized coordinates to match each depth map pixel.
-    # Shape them into [B, 4].
-    x_coords = 2 * pixel_coords_2D[:,0] / shape[1] - 1 + 1 / shape[1]
-    y_coords = 2 * pixel_coords_2D[:,1] / shape[0] - 1 + 1 / shape[0]
-    z_coords = torch.zeros_like(x_coords)
-    projected_coords = torch.stack([x_coords, y_coords, z_coords, torch.ones_like(x_coords, dtype=torch.float32)], axis=-1)
     if uses_depth_map:
         depths = depth_data[pixel_coords_2D[:,1], pixel_coords_2D[:,0]][:,0]
     else:
         depths = depth_data
+    depths = torch.minimum(depths, torch.tensor(0.98).cuda())
+
+    # Create homogenous normalized coordinates to match each depth map pixel.
+    # Shape them into [B, 4].
+    x_coords = 2 * pixel_coords_2D[:,0] / shape[1] - 1 + 1 / shape[1]
+    y_coords = 2 * pixel_coords_2D[:,1] / shape[0] - 1 + 1 / shape[0]
+    z_coords = 2 * depths - 1
+    projected_coords = torch.stack([x_coords, y_coords, z_coords, torch.ones_like(x_coords, dtype=torch.float32)], axis=-1)
 
     # Calculate the view space coordinates
     view_coordinates = projected_coords @ inv_projection
     view_coordinates = view_coordinates / view_coordinates[:,3].reshape([B, 1])
-    view_coordinates = view_coordinates / torch.linalg.norm(view_coordinates[:,:3], dim=1).unsqueeze(-1)
-    z_want = znear + depths * (zfar - znear)
-    z_want = -z_want
-    view_coordinates = view_coordinates * (z_want / view_coordinates[:,2]).unsqueeze(-1)
-    view_coordinates[:,3] = 1
+    #view_coordinates = view_coordinates / torch.linalg.norm(view_coordinates[:,:3], dim=1).unsqueeze(-1)
+    #z_want = znear + depths * (zfar - znear)
+    #z_want = -z_want
+    #view_coordinates = view_coordinates * (z_want / view_coordinates[:,2]).unsqueeze(-1)
+    #view_coordinates[:,3] = 1
 
     # Calculate the world space coordinates
     if len(inv_view.shape) == 2:
@@ -640,7 +643,7 @@ def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar,
 def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y, znear, zfar):
 
     aspect_ratio = width / height
-    a = 1 / (aspect_ratio * torch.tan(torch.tensor(0.5 * camera_angle_y)))
+    a = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_x)))
     b = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
 
     projection_matrix = torch.tensor([
@@ -655,7 +658,7 @@ def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y
 
 def _inverse_projection_matrix(width, height, camera_angle_x, camera_angle_y, znear, zfar):
     aspect_ratio = width / height
-    a = 1 / (aspect_ratio * torch.tan(torch.tensor(0.5 * camera_angle_y)))
+    a = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
     b = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
     c = -(zfar + znear) / (2 * zfar * znear)
     d = (zfar - znear) / (2 * zfar * znear)
