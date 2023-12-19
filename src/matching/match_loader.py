@@ -21,9 +21,12 @@ class PointData:
         # [[(frame_features_index, x, y), ...], ...]
         self.matches = []
 
+    def n_frames(self) -> int:
+        ''' Gets the total number of frames in this dataset. '''
+        return len(self.id_to_frame_features)
+
     def n_features(self) -> int:
         ''' Gets the total number of features in this dataset. '''
-
         return len(self.id_to_point_index)
     
     def n_frame_features(self) -> int:
@@ -33,6 +36,64 @@ class PointData:
         for frame_features in self.id_to_frame_features.values():
             count += len(frame_features.coords_2D)
         return count
+    
+    def filter_by_err(self, n_best_per_frame):
+        ''' Reject features that aren't among n_best_per_frame in at least one
+            frame. '''
+        
+        # Each frame identifies its top n_best_per_frame features.
+        frame_bests = [[] for i in range(0, self.n_frames())]
+        for frame_features in self.id_to_frame_features.values():
+            frame_index = frame_features.frame.index
+
+            frame_feature_indices = []
+            frame_feature_errs = []
+            for point_3D_id in frame_features.point_3D_ids:
+                index_3D = self.id_to_point_index[point_3D_id]
+                err = self.errs[index_3D]
+                frame_feature_indices.append(index_3D)
+                frame_feature_errs.append(err)
+
+            frame_feature_indices = np.array(frame_feature_indices)
+            frame_feature_errs = np.array(frame_feature_errs)
+
+            # Apply err sorting to frame_feature_indices.
+            sorting = np.argsort(frame_feature_errs)
+            frame_feature_indices = frame_feature_indices[sorting]
+            del frame_feature_errs
+
+            frame_bests[frame_index] = frame_feature_indices[:n_best_per_frame]
+
+        # Aggregate these ratings together.
+        indices_to_keep = set(index for frame_best_list in frame_bests for index in frame_best_list)
+        self.filter_by_index(list(indices_to_keep))
+
+    def _rebuild_id_to_point_index(self):
+        self.id_to_point_index = {id: index for (index, id) in enumerate(self.ids)}
+
+    def filter_by_index(self, indices_to_keep):
+        ''' Filter 3D points by their index. The 2D and 3D data for any point
+            being filtered out will be deleted. '''
+        
+        # 3D.
+        indices_to_keep = np.array(indices_to_keep)
+        self.coords = self.coords[indices_to_keep]
+        self.errs = self.errs[indices_to_keep]
+        self.ids = self.ids[indices_to_keep]
+        self._rebuild_id_to_point_index()
+        self.matches = [value for index, value in enumerate(self.matches) if index in indices_to_keep]
+
+        # 2D.
+        for frame_features in self.id_to_frame_features.values():
+            mask = np.isin(frame_features.point_3D_ids, self.ids)
+            frame_features.point_3D_ids = frame_features.point_3D_ids[mask]
+            frame_features.coords_2D = frame_features.coords_2D[mask]
+
+
+
+
+
+
 
 class Point3D:
     def __init__(self, id, point_2Ds):

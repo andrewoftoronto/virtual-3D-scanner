@@ -6,7 +6,7 @@ def mv(old_path, new_path):
 
 def main():
     source_folder = "C:/Program Files (x86)/Steam/steamapps/common/Valheim"
-    dest_folder = "C:/Users/Andrew/colmap-projects/valheim"
+    dest_folder = "C:/Users/Andrew/colmap-projects/forest"
 
     # Make dest folders.
     colour_dest = os.path.join(dest_folder, "images")
@@ -27,7 +27,7 @@ def main():
     # Move each file to where it belongs.
     for (i, colour_file_name) in enumerate(bmps):
         base_name = colour_file_name.replace(" BackBuffer.bmp", "")
-        new_base_name = str(n + i).zfill(3)
+        new_base_name = str(n + i).zfill(4)
 
         old_colour = os.path.join(source_folder, colour_file_name)
         new_colour = os.path.join(dest_folder, "images/", f"{new_base_name}.bmp")
@@ -41,7 +41,7 @@ def main():
         normal_file_name = f"{base_name} NormalMap.exr"
         old_normal = os.path.join(source_folder, normal_file_name)
         new_normal = os.path.join(dest_folder, "normal/", f"{new_base_name}.exr")
-        mv(old_normal, new_normal)
+        #mv(old_normal, new_normal)
 
 
 if __name__ == '__main__':

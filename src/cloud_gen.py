@@ -3,6 +3,7 @@ from itertools import chain
 import torch
 import numpy as np
 from .source_loader import RawSceneData
+import open3d as o3d
 
 
 class ColinearConstraint:
@@ -30,9 +31,13 @@ class ColinearConstraint:
 
 class CameraInferenceContext:
 
-    def __init__(self, scene_data: RawSceneData, orientation_constraints, 
+    def __init__(self, 
+            scene_data: RawSceneData, 
+            fixed_pos_constraints,
+            orientation_constraints, 
             colinear_constraints: List[ColinearConstraint]):
         self.scene_data: RawSceneData = scene_data
+        self.fixed_pos_constraints = fixed_pos_constraints
         self.orientation_constraints = orientation_constraints
         self.colinear_constraints = colinear_constraints
 
@@ -51,9 +56,6 @@ class CameraInferenceContext:
 def cloud_gen(scene: RawSceneData):
     ''' Generate a point cloud from the given raw scene data. '''
 
-    znear = 0.0001
-    zfar = 10000
-
     fl_x = scene.proj_params.fl_x
     fl_y = scene.proj_params.fl_y
     cx = scene.proj_params.cx
@@ -62,54 +64,83 @@ def cloud_gen(scene: RawSceneData):
     h = scene.proj_params.h
 
     # Infer zparams using images that point to the same place.
-    _infer_zparams(scene)
+    #_infer_zparams(scene)
+    scene.proj_params.zfar = 999999999
+    scene.proj_params.znear = 0.08526150593834063
 
-    inv = _inverse_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear), torch.tensor(scene.proj_params.zfar)).cuda().T
+    proj = _perspective_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear, dtype=torch.float32), torch.tensor(scene.proj_params.zfar, dtype=torch.float32)).cuda().T
+    inv = torch.linalg.inv(proj)
 
     coords = np.zeros([0,3], dtype=np.float64)
     colours = np.zeros([0,3], dtype=np.float64)
     normals = np.zeros([0,3], dtype=np.float64)
+    clouds = []
     for (i, frame) in enumerate(scene.frames):
-        #onlys = ['54', '58']
-        onlys = ['54', '58', '62', '66', '69', '85']
-        if not any([only in frame.colour_path for only in onlys]):
-            continue
-        #if i >= 20:
-        #    continue
 
         transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
         inv_view = transform_matrix
 
         depth_map = torch.from_numpy(frame.get_depth()).cuda()
+        #depth_map = torch.flip(depth_map, dims=[0])
 
         # TODO: Codify this better.
         colour_map = torch.from_numpy(frame.get_colour()).cuda()
-        colour_map = torch.flip(colour_map, dims=[0])
         colour_map = colour_map[:,:,:3] / 255
 
-        full_depths = scene.proj_params.znear + (scene.proj_params.zfar - scene.proj_params.znear) * depth_map
-        #colour_map = unfog(colour_map, full_depths, scene.fog_colour, scene.fog_density)
-
         frame_coords, frame_colours, tex = _depth_to_3D(depth_map, inv, inv_view, scene.proj_params.znear, scene.proj_params.zfar, colour_map)
+        n_points = len(frame_coords)
 
-        # First we must convert out of RGB and into screen space normals. Then,
-        # transform screen space normals into world space.
-        frame_normals = torch.from_numpy(frame.get_normal()).cuda().reshape([-1, 3])
-        frame_normals = 2 * (frame_normals - 0.5)
-        frame_normals[:,1] = -frame_normals[:,1]
-        frame_normals[:,0] = -frame_normals[:,0]
+        shape = frame.get_depth().shape
+        c = frame_coords.reshape([shape[0], shape[1], 3])
+        t1 = c[1:,:-1] - c[:-1,:-1]
+        t2 = c[:-1,1:] - c[:-1,:-1]
+        n = torch.cross(t2, t1, dim=2)
+        n = n / torch.norm(n, dim=2).unsqueeze(-1)
 
-        # Camera transform is rigid, so no need to inverse-transpose.
-        normal_transform = inv_view[:3,:3]
-        frame_normals = torch.matmul(frame_normals, normal_transform)
-        frame_normals = frame_normals / torch.linalg.norm(frame_normals, dim=1).unsqueeze(-1)
+        frame_coords = c[:-1,:-1]
+        frame_normals = n[:-1,:-1]
+        frame_colours = frame_colours.reshape([shape[0], shape[1], 3])[:-1,:-1]
 
-        #frame_colours = tex
+        frame_coords = frame_coords.reshape([-1, 3]).detach().cpu().numpy()
+        frame_normals = frame_normals.reshape([-1, 3]).detach().cpu().numpy()
+        frame_colours = frame_colours.reshape([-1, 3]).detach().cpu().numpy()
 
-        coords = np.concatenate((coords, frame_coords.detach().to(torch.float64).cpu()), axis=0)
-        colours = np.concatenate((colours, frame_colours.detach().to(torch.float64).cpu()), axis=0)
-        normals = np.concatenate((normals, frame_normals.detach().to(torch.float64).cpu()), axis=0)
-    return coords, colours, normals
+        #pcd = o3d.geometry.PointCloud()
+        #pcd.points = o3d.utility.Vector3dVector(frame_coords.detach().cpu().numpy())
+        #pcd.normals = o3d.utility.Vector3dVector(frame_normals.detach().cpu().numpy())
+        #pcd.colors = o3d.utility.Vector3dVector(frame_colours.detach().cpu().numpy())
+        '''if prev_cloud is not None:
+            icp_result = o3d.pipelines.registration.registration_icp(
+                pcd, prev_cloud,
+                max_correspondence_distance=0.05,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200))
+            pcd.transform(icp_result.transformation)
+        prev_cloud = pcd'''
+
+        onlys = ['000', '001', '009', '017', '002', '004', '023']
+        excludes = ['000']
+        #if any([only in frame.colour_path for only in onlys]):
+        #if not any([exclude in frame.colour_path for exclude in excludes]):
+        if True:
+            #capture_clouds.append(pcd)
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(frame_coords)
+            pcd.normals = o3d.utility.Vector3dVector(frame_normals)
+            pcd.colors = o3d.utility.Vector3dVector(frame_colours)
+            clouds.append(pcd)
+        
+    #o3d.visualization.draw_geometries(capture_clouds)
+    #exit(0)
+
+    return clouds, coords, colours, normals
+
+
+def apply_fixed_pos_constraints(context: CameraInferenceContext):
+    for frame_keyword in context.fixed_pos_constraints:
+        frame = context.scene_data.lookup(frame_keyword)
+        context.learnable_vector_bitmap[frame.index] = 0
 
 
 def apply_orientation_constraints(context: CameraInferenceContext):
@@ -143,18 +174,18 @@ def apply_orientation_constraints(context: CameraInferenceContext):
         if constrained_orientation_bitmap[frame.index]:
             continue
         cam_to_orientation_source[frame.index] = orient_source_i
-        unique_orientations[orient_source_i] = frame.transform[3:,3:]
+        unique_orientations[orient_source_i] = matrix_to_quaternion(frame.transform[:3, :3])
         orient_source_i += 1
     for constraint in context.orientation_constraints:
         source_index = orient_source_i
         orient_source_i += 1
 
-        unique_orientations[source_index] = constraint[0].transform[3:,3:]
+        unique_orientations[source_index] = matrix_to_quaternion(frame.transform[:3, :3])
         for frame in constraint:
             cam_to_orientation_source[frame.index] = source_index 
 
     context.cam_to_orientation_source = torch.from_numpy(cam_to_orientation_source).cuda()
-    context.orientation_params = torch.nn.Parameter(torch.from_numpy(unique_orientations)).cuda()
+    context.orientation_params = torch.nn.Parameter(torch.from_numpy(unique_orientations).cuda())
 
 def apply_colinear_constraints(context: CameraInferenceContext):
     n_frames = len(context.scene_data.frames)
@@ -165,7 +196,7 @@ def apply_colinear_constraints(context: CameraInferenceContext):
     # is located along.
     frame_to_parent = -np.ones(shape=[n_frames], dtype=np.int64)
     learnable_dist_bitmap = np.zeros(shape=[n_frames], dtype=bool)
-    camera_vectors = np.zeros(shape=[n_frames, 3])
+    camera_vectors = np.zeros(shape=[n_frames, 3], dtype=np.float32)
     for constraint in context.colinear_constraints:
         constraint.resolve_names(context.scene_data)
         parent_index = constraint.parent.index
@@ -279,11 +310,12 @@ def apply_colinear_constraints(context: CameraInferenceContext):
     n_learnable_roots = np.sum(context.learnable_vector_bitmap).astype(np.int64)
     n_colinear_vectors = n_frames - n_roots
     n_learnable_dists = np.sum(learnable_dist_bitmap).astype(np.int64)
-    context.vector_params = torch.nn.Parameter(torch.zeros(size=[n_learnable_roots, 3]), requires_grad=True)
-    context.dist_params = torch.nn.Parameter(torch.zeros(size=[n_learnable_dists]), requires_grad=True)
+    context.vector_params = torch.nn.Parameter(torch.zeros(size=[n_learnable_roots, 3]).cuda(), requires_grad=True)
+    context.dist_params = torch.nn.Parameter(torch.zeros(size=[n_learnable_dists]).cuda(), requires_grad=True)
     context.learnable_vectors = torch.zeros(size=[n_learnable_roots], dtype=torch.int64)
     context.colinear_vectors = torch.zeros(size=[n_colinear_vectors, 2], dtype=torch.int64)
     context.learnable_dists = torch.zeros(size=[n_learnable_dists], dtype=torch.int64)
+    context.vectors_to_frame_matrix = torch.from_numpy(vectors_to_frames).cuda()
 
     # Assign learnable params and colinear vector sources.
     learnable_vector_i = 0
@@ -315,6 +347,7 @@ def apply_colinear_constraints(context: CameraInferenceContext):
 
 
 def _infer_zparams(scene: RawSceneData):
+    n_frames = len(scene.frames)
 
     fl_x = scene.proj_params.fl_x
     fl_y = scene.proj_params.fl_y
@@ -327,28 +360,40 @@ def _infer_zparams(scene: RawSceneData):
             torch.tensor(0.1, dtype=torch.float32), 
             torch.tensor(1000,  dtype=torch.float32)).T.cuda()
 
-    # Create matrix representing cameras that participate in co-linear 
-    # constraints.
+    f1 = scene.lookup('003')
+    f2 = scene.lookup('006')
+    d1 = f1.get_depth()[720, 1280, 0]
+    d2 = f2.get_depth()[720, 1280, 0]
+    dist = np.linalg.norm(f1.get_position() - f2.get_position())
+    slope = dist / np.abs(d2 - d1)
+
+    f1 = scene.lookup('004')
+    f2 = scene.lookup('005')
+    d1 = f1.get_depth()[720, 1280, 0]
+    d2 = f2.get_depth()[720, 1280, 0]
+    dist = np.linalg.norm(f1.get_position() - f2.get_position())
+    slope2 = dist / np.abs(d2 - d1)
+
+    fixed_pos_constraints = [
+        '003'
+    ]
     orientation_constraints = [
-        ['066', '067', '068', '069']
+       # ['003', '004', '005', '006']
     ]
     colinear_constraints = [
-        ColinearConstraint('066', (0, 0, 1), [('067', False), '068', '069'])
+       #    ColinearConstraint('003', (0, 0, 1), [('006',  False)])
     ]
-    context = CameraInferenceContext(scene, orientation_constraints, 
-            colinear_constraints)
+    context = CameraInferenceContext(
+        scene, 
+        fixed_pos_constraints,                 
+        orientation_constraints, 
+        colinear_constraints
+    )
+    apply_fixed_pos_constraints(context)
     apply_orientation_constraints(context)
     apply_colinear_constraints(context)
 
-    # Camera translations and rotations grouped in a single tensor each.
-    n_frames = len(scene.frames)
-    original_camera_translations = torch.zeros(size=[n_frames, 3]).cuda()
-    original_camera_rotations = torch.zeros(size=[n_frames, 3, 3]).cuda()
-    for (cam_idx, frame) in enumerate(scene.frames):
-        transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
-        inv_view = transform_matrix
-        original_camera_translations[cam_idx] = inv_view[3,:3]
-        original_camera_rotations[cam_idx] = inv_view[:3,:3]
+    #scene.feature_data.filter_by_err(10)
 
     # Create tensors for: 
     # - Number of frames that contain each feature.
@@ -394,55 +439,39 @@ def _infer_zparams(scene: RawSceneData):
     zstats_buf = torch.tensor([-0.8, 6.64]).cuda()
     zstats_param = torch.nn.Parameter(zstats_buf, requires_grad=True)
 
-    # Camera position parameters.
-    cam_pos_buf = torch.zeros(size=[len(scene.frames), 3]).cuda() 
-    cam_param = torch.nn.Parameter(cam_pos_buf, requires_grad=True)
+    def compute_transforms():
 
-    # camera orientation parameters.
-    cam_orientation_buf = torch.concat(
-        (torch.zeros(size=[len(scene.frames), 3]), torch.ones(size=[len(scene.frames), 1])),
-        axis=1
-    ).cuda().detach()
-    cam_orientation_param = torch.nn.Parameter(cam_orientation_buf, requires_grad=True)
+        # Set up per-camera transforms.
+        total_transforms = torch.zeros(size=[n_frames, 4, 4]).cuda()
+        total_transforms[:, :3, :3] = make_rotation(context.orientation_params[context.cam_to_orientation_source])
+        total_transforms[:, 3, 3] = 1
 
-    # Ground truth position and ground truth distance.
-    fixed_cam_index = scene.lookup(ground_truth_frames[0]).index
-    second_cam_index = scene.lookup(ground_truth_frames[1]).index
+        # Translations use matrix multiplication to factor in colinear constraints.
+        dists = context.default_dists.clone()
+        dists[context.learnable_dists] = context.dist_params
+        camera_vectors = context.default_camera_vectors.clone()
+        camera_vectors[context.learnable_vectors] = context.vector_params
+        colinear_indices = context.colinear_vectors[:, 0]
+        colinear_source_cams = context.colinear_vectors[:, 1]
+        if len(colinear_indices) > 0:
+            camera_vectors[colinear_indices] = (context.default_camera_vectors[colinear_indices].view([-1, 1, 3]) @ total_transforms[colinear_source_cams, :3, :3])[0]
+        total_transforms[:, 3, 0] = (dists.view([1, -1]) * camera_vectors[:, 0].view([1, -1])) @ context.vectors_to_frame_matrix
+        total_transforms[:, 3, 1] = (dists.view([1, -1]) * camera_vectors[:, 1].view([1, -1])) @ context.vectors_to_frame_matrix
+        total_transforms[:, 3, 2] = (dists.view([1, -1]) * camera_vectors[:, 2].view([1, -1])) @ context.vectors_to_frame_matrix
 
-    # Orientation constraints.
-    processed_orientation_constraints = []
-    for constraint in orientation_constraints:
-        processed = [scene.lookup(search_term) for search_term in constraint]
-        processed_orientation_constraints.append(processed)
-
-        first_frame = processed[0]
-        for frame in processed[1:]:
-            frame.transform[:3,:3] = first_frame.transform[:3,:3]
-            original_camera_rotations[frame.index] = original_camera_rotations[first_frame.index]
-
-    # Lineup constraints.
-    processed_lineup_constraints = []
-    for constraint in lineup_constraints:
-        processed = [scene.lookup(search_term) for search_term in constraint]
-        processed_lineup_constraints.append(processed)
+        return total_transforms
 
     def objective_fn():
         optimizer.zero_grad()
 
         zstats = torch.exp(zstats_param)
 
-        # Combine our adjusted parameters on top of the old camera parameters.
-        total_translations = original_camera_translations + cam_param
-        total_rotations = original_camera_rotations @ make_rotation(cam_orientation_param)
-        total_transforms = torch.zeros(size=[n_frames, 4, 4]).cuda()
-        total_transforms[:, 3, 3] = 1
-        total_transforms[:, :3, :3] = total_rotations
-        total_transforms[:, 3, :3] = total_translations
+        total_transforms = compute_transforms()
 
         inv_view = total_transforms[frame_feature_to_cam]
 
         coords_3D, _, _ = _depth_to_3D(frame_feature_depths, inv_proj, inv_view, 
-                    zstats[0], zstats[1], pixel_coords_2D=frame_feature_pixel_coords, 
+                    zstats[0], slope + zstats[0], pixel_coords_2D=frame_feature_pixel_coords, 
                     uses_depth_map=False, shape=shape)
         
         # Compute means of 3D points for each feature.
@@ -467,9 +496,10 @@ def _infer_zparams(scene: RawSceneData):
         #print(loss.detach())
         return loss
     
-    optimizer = torch.optim.Adam([zstats_param, cam_param, cam_orientation_param], lr=2e-1)
+    #optimizer = torch.optim.Adam([zstats_param, context.orientation_params, context.vector_params, context.dist_params], lr=2e-1)
+    optimizer = torch.optim.Adam([zstats_param], lr=2e-1)
 
-    cam_param.requires_grad = False
+    '''cam_param.requires_grad = False
     cam_orientation_param.requires_grad = False
 
     for t in range(0, 100):
@@ -482,8 +512,8 @@ def _infer_zparams(scene: RawSceneData):
         print(f"Step {t}: ", loss)
 
     cam_param.requires_grad = True
-    cam_orientation_param.requires_grad = True
-    for t in range(0, 6000):
+    cam_orientation_param.requires_grad = True'''
+    for t in range(0, 100):
 
         if t == 0:
             for param_group in optimizer.param_groups:
@@ -499,57 +529,24 @@ def _infer_zparams(scene: RawSceneData):
         if t % 10 == 0:
             print(f"Step {t}: ", loss)
 
-        # Preserve some things about the first two cameras to prevent degenerate
-        # solution:
-        # - first cam's original position is taken as ground truth.
-        # - second cam's distance to first cam is taken as ground truth.
-        cam_param.data[fixed_cam_index] = 0
-        original_dist = torch.norm(original_camera_translations[fixed_cam_index] - original_camera_translations[second_cam_index])
-        second_to_first = ((original_camera_translations[fixed_cam_index] + cam_param.data[fixed_cam_index]) - 
-                (original_camera_translations[second_cam_index] + cam_param.data[second_cam_index]))
-        new_dist = torch.norm(second_to_first)
-        cam_param.data[second_cam_index] = cam_param.data[second_cam_index] + second_to_first / new_dist * (new_dist - original_dist)
-        second_to_first = ((original_camera_translations[fixed_cam_index] + cam_param.data[fixed_cam_index]) - 
-                (original_camera_translations[second_cam_index] + cam_param.data[second_cam_index]))
-        new_dist = torch.norm(second_to_first)
-        
-        # Enforce orientation constaints.
-        # Sets of frames are known to share the exact same orientation as the
-        # first frame in the constraint.
-        for constraint in processed_orientation_constraints:
-            first_orientation_param  = cam_orientation_param.data[constraint[0].index]
-            for frame in constraint[1:]:
-                cam_orientation_param.data[frame.index] = first_orientation_param
-
-        # Enforce lineup constraints.
-        # Sets of frames are known to be located exactly in the forward or 
-        # backward direction from the first frame in the constraint.
-        for constraint in processed_lineup_constraints:
-            first_frame = constraint[0]
-            start = original_camera_translations[first_frame.index] + cam_param.data[first_frame.index]
-            rotation = original_camera_rotations[first_frame.index] @ make_rotation(cam_orientation_param[first_frame.index].unsqueeze(0))[0]
-            dir = rotation[2,:]
-            for frame in constraint[1:]:
-                old_pos = original_camera_translations[frame.index] + cam_param.data[frame.index]
-                z = (old_pos - start).dot(dir)
-                new_pos = start + z * dir
-                cam_param.data[frame.index] = new_pos - original_camera_translations[frame.index]
-                pass
-
-        if loss < 0.05:
-            break
-
-
     zstats = torch.exp(zstats_param)
     scene.proj_params.znear = float(zstats[0].detach())
-    scene.proj_params.zfar = float(zstats[1].detach())
+    scene.proj_params.zfar = slope + scene.proj_params.znear 
+
+    scene.proj_params.znear = 0.07
+    scene.proj_params.zfar = slope + scene.proj_params.zfar
     print(f"Selected znear and zfar: {scene.proj_params.znear} and {scene.proj_params.zfar}")
     
     # Permanently apply our adjusted camera positions.
-    for (cam_idx, frame) in enumerate(scene.frames):
-        frame.transform[:3,:3] = np.matmul(frame.transform[:3:,:3], make_rotation(cam_orientation_param[cam_idx].unsqueeze(0)).detach().cpu().numpy()) 
-        frame.transform[3:,:3] = frame.transform[3:,:3] + cam_param[cam_idx].detach().cpu().numpy()
+    #for (cam_idx, frame) in enumerate(scene.frames):
+    #    frame.transform[:3,:3] = np.matmul(frame.transform[:3:,:3], make_rotation(cam_orientation_param[cam_idx].unsqueeze(0)).detach().cpu().numpy()) 
+    #    frame.transform[3:,:3] = frame.transform[3:,:3] + cam_param[cam_idx].detach().cpu().numpy()
 
+    transforms = compute_transforms()
+    #for (cam_idx, frame) in enumerate(scene.frames):
+    #    frame.transform = transforms[cam_idx].detach().cpu().numpy()
+
+    #raise Exception("TODO: Apply params to transforms.")
     pass
     
 
@@ -574,25 +571,27 @@ def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar,
     else:
         B = len(pixel_coords_2D)
 
-    # Create homogenous normalized coordinates to match each depth map pixel.
-    # Shape them into [B, 4].
-    x_coords = 2 * pixel_coords_2D[:,0] / shape[1] - 1 + 1 / shape[1]
-    y_coords = 2 * pixel_coords_2D[:,1] / shape[0] - 1 + 1 / shape[0]
-    z_coords = torch.zeros_like(x_coords)
-    projected_coords = torch.stack([x_coords, y_coords, z_coords, torch.ones_like(x_coords, dtype=torch.float32)], axis=-1)
     if uses_depth_map:
         depths = depth_data[pixel_coords_2D[:,1], pixel_coords_2D[:,0]][:,0]
     else:
         depths = depth_data
+    #depths = torch.minimum(depths, torch.tensor(0.999).cuda())
+
+    # Create homogenous normalized coordinates to match each depth map pixel.
+    # Shape them into [B, 4].
+    x_coords = 2 * pixel_coords_2D[:,0] / shape[1] - 1 + 1 / shape[1]
+    y_coords = 2 * pixel_coords_2D[:,1] / shape[0] - 1 + 1 / shape[0]
+    z_coords = 2 * depths - 1
+    projected_coords = torch.stack([x_coords, y_coords, z_coords, torch.ones_like(x_coords, dtype=torch.float32)], axis=-1)
 
     # Calculate the view space coordinates
     view_coordinates = projected_coords @ inv_projection
     view_coordinates = view_coordinates / view_coordinates[:,3].reshape([B, 1])
-    view_coordinates = view_coordinates / torch.linalg.norm(view_coordinates[:,:3], dim=1).unsqueeze(-1)
-    z_want = znear + depths * (zfar - znear)
-    z_want = -z_want
-    view_coordinates = view_coordinates * (z_want / view_coordinates[:,2]).unsqueeze(-1)
-    view_coordinates[:,3] = 1
+    #view_coordinates = view_coordinates / torch.linalg.norm(view_coordinates[:,:3], dim=1).unsqueeze(-1)
+    #z_want = znear + depths * (zfar - znear)
+    #z_want = -z_want
+    #view_coordinates = view_coordinates * (z_want / view_coordinates[:,2]).unsqueeze(-1)
+    #view_coordinates[:,3] = 1
 
     # Calculate the world space coordinates
     if len(inv_view.shape) == 2:
@@ -603,6 +602,12 @@ def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar,
 
     # Normalize to get the 3D coordinates
     point_3D = point_homogeneous_world[:,:3] / point_homogeneous_world[:,3].reshape([B, 1])
+
+    limit = 30
+    dists = torch.linalg.norm(point_3D, dim=1)
+    mask = dists >= limit
+    divisor = dists / limit * mask + ~mask * 1
+    point_3D = point_3D / divisor.unsqueeze(-1)
 
     if colour_map is not None:
         colours = colour_map.reshape([shape[0] * shape[1], 3])
@@ -617,12 +622,12 @@ def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar,
 def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y, znear, zfar):
 
     aspect_ratio = width / height
-    a = 1 / (aspect_ratio * torch.tan(torch.tensor(0.5 * camera_angle_y)))
+    a = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_x)))
     b = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
 
     projection_matrix = torch.tensor([
         a, 0, 0, 0,
-        0, b, 0,
+        0, b, 0, 0,
         0, 0, -(zfar + znear) / (zfar - znear), -(2 * zfar * znear) / (zfar - znear),
         0, 0, -1, 0
     ]).reshape((4, 4))
@@ -632,7 +637,7 @@ def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y
 
 def _inverse_projection_matrix(width, height, camera_angle_x, camera_angle_y, znear, zfar):
     aspect_ratio = width / height
-    a = 1 / (aspect_ratio * torch.tan(torch.tensor(0.5 * camera_angle_y)))
+    a = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
     b = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
     c = -(zfar + znear) / (2 * zfar * znear)
     d = (zfar - znear) / (2 * zfar * znear)
@@ -681,3 +686,31 @@ def make_rotation(quaternions):
     )
 
     return rotation_matrices.reshape([batch_size, 3, 3])
+
+
+
+def matrix_to_quaternion(matrix):
+
+    # Ensure the matrix is a valid 3x3 rotation matrix
+    if matrix.shape != (3, 3):
+        raise ValueError("Input matrix must be a 3x3 matrix")
+
+    # Ensure the matrix is a proper rotation matrix
+    is_rotation_matrix = np.allclose(np.dot(matrix, matrix.T), np.identity(3))
+    if not is_rotation_matrix:
+        raise ValueError("Input matrix is not a valid rotation matrix")
+
+    # Extract the trace and diagonal elements
+    trace = np.trace(matrix)
+    diag = np.diagonal(matrix)
+
+    # Calculate the quaternion components
+    w = np.sqrt(1.0 + trace) / 2.0
+    x = (matrix[2, 1] - matrix[1, 2]) / (4.0 * w)
+    y = (matrix[0, 2] - matrix[2, 0]) / (4.0 * w)
+    z = (matrix[1, 0] - matrix[0, 1]) / (4.0 * w)
+
+    # Ensure the quaternion is in the correct order (x, y, z, w)
+    quaternion = np.array([x, y, z, w])
+
+    return quaternion
