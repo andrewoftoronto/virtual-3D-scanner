@@ -66,7 +66,7 @@ def cloud_gen(scene: RawSceneData):
     # Infer zparams using images that point to the same place.
     #_infer_zparams(scene)
     scene.proj_params.zfar = 999999999
-    scene.proj_params.znear = 0.69
+    scene.proj_params.znear = 0.08526150593834063
 
     proj = _perspective_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear, dtype=torch.float32), torch.tensor(scene.proj_params.zfar, dtype=torch.float32)).cuda().T
     inv = torch.linalg.inv(proj)
@@ -74,8 +74,7 @@ def cloud_gen(scene: RawSceneData):
     coords = np.zeros([0,3], dtype=np.float64)
     colours = np.zeros([0,3], dtype=np.float64)
     normals = np.zeros([0,3], dtype=np.float64)
-    capture_clouds = []
-    prev_cloud = None
+    clouds = []
     for (i, frame) in enumerate(scene.frames):
 
         transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
@@ -91,31 +90,6 @@ def cloud_gen(scene: RawSceneData):
         frame_coords, frame_colours, tex = _depth_to_3D(depth_map, inv, inv_view, scene.proj_params.znear, scene.proj_params.zfar, colour_map)
         n_points = len(frame_coords)
 
-        # First we must convert out of RGB and into screen space normals. Then,
-        # transform screen space normals into world space.
-        '''frame_normals = torch.from_numpy(frame.get_normal()).cuda().reshape([-1, 3])
-        frame_normals[:,0] = -2 * (frame_normals[:, 0] - 0.5)
-        frame_normals[:,1] = -2 * (frame_normals[:, 1] - 0.5)
-        frame_normals[:,2] = 2 * (frame_normals[:, 2] - 0.5)
-        homogenous_frame_normals = torch.concat((frame_normals, torch.zeros(size=[n_points, 1]).cuda()), axis=1)
-
-        homogenous_frame_coords = torch.concat((frame_coords, torch.ones(size=[n_points, 1]).cuda()), axis=1)
-        homogenous_view_coords = torch.matmul(homogenous_frame_coords, view)
-        homogenous_screen_coords = torch.matmul(homogenous_view_coords, proj)
-        homogenous_screen_coords = homogenous_screen_coords / homogenous_screen_coords[:,3].unsqueeze(-1)
-        n_h_screen_coords = homogenous_screen_coords + homogenous_frame_normals * 1e-6
-        n_h_view_coords = torch.matmul(n_h_screen_coords, inv)
-        n_h_view_coords = n_h_view_coords / n_h_view_coords[:,3].unsqueeze(-1)
-        n_h_world_coords = torch.matmul(n_h_view_coords, inv_view)
-        frame_normals = n_h_world_coords[:,:3] - frame_coords
-        frame_normals = frame_normals / torch.norm(frame_normals, dim=1).unsqueeze(-1)'''
-
-        #homogenous_frame_normals = torch.concat((frame_normals, torch.zeros(size=[n_points, 1]).cuda()), axis=1)
-        #homogenous_frame_normals = torch.matmul(homogenous_frame_normals, inv)
-        #frame_normals =  homogenous_frame_normals[:,:3] / homogenous_frame_normals[:,3].unsqueeze(-1)
-        #frame_normals = frame_normals / torch.linalg.norm(frame_normals, dim=1).unsqueeze(-1)
-        #frame_normals = frame_normals.matmul(inv_view[:3,:3])
-
         shape = frame.get_depth().shape
         c = frame_coords.reshape([shape[0], shape[1], 3])
         t1 = c[1:,:-1] - c[:-1,:-1]
@@ -127,15 +101,9 @@ def cloud_gen(scene: RawSceneData):
         frame_normals = n[:-1,:-1]
         frame_colours = frame_colours.reshape([shape[0], shape[1], 3])[:-1,:-1]
 
-        frame_coords = frame_coords.reshape([-1, 3])
-        frame_normals = frame_normals.reshape([-1, 3])
-        frame_colours = frame_colours.reshape([-1, 3])
-
-        '''frame_normals = torch.from_numpy(frame.get_normal()).cuda().reshape([-1, 3])
-        frame_normals[:,0] = -2 * (frame_normals[:, 0] - 0.5)
-        frame_normals[:,1] = -2 * (frame_normals[:, 1] - 0.5)
-        frame_normals[:,2] = 2 * (frame_normals[:, 2] - 0.5)
-        homogenous_frame_normals = torch.concat((frame_normals, torch.zeros(size=[n_points, 1]).cuda()), axis=1)'''
+        frame_coords = frame_coords.reshape([-1, 3]).detach().cpu().numpy()
+        frame_normals = frame_normals.reshape([-1, 3]).detach().cpu().numpy()
+        frame_colours = frame_colours.reshape([-1, 3]).detach().cpu().numpy()
 
         #pcd = o3d.geometry.PointCloud()
         #pcd.points = o3d.utility.Vector3dVector(frame_coords.detach().cpu().numpy())
@@ -151,18 +119,22 @@ def cloud_gen(scene: RawSceneData):
         prev_cloud = pcd'''
 
         onlys = ['000', '001', '009', '017', '002', '004', '023']
+        excludes = ['000']
         #if any([only in frame.colour_path for only in onlys]):
+        #if not any([exclude in frame.colour_path for exclude in excludes]):
         if True:
             #capture_clouds.append(pcd)
 
-            coords = np.concatenate((coords, frame_coords.detach().to(torch.float64).cpu()), axis=0)
-            colours = np.concatenate((colours, frame_colours.detach().to(torch.float64).cpu()), axis=0)
-            normals = np.concatenate((normals, frame_normals.detach().to(torch.float64).cpu()), axis=0)
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(frame_coords)
+            pcd.normals = o3d.utility.Vector3dVector(frame_normals)
+            pcd.colors = o3d.utility.Vector3dVector(frame_colours)
+            clouds.append(pcd)
         
     #o3d.visualization.draw_geometries(capture_clouds)
     #exit(0)
 
-    return coords, colours, normals
+    return clouds, coords, colours, normals
 
 
 def apply_fixed_pos_constraints(context: CameraInferenceContext):
@@ -603,7 +575,7 @@ def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar,
         depths = depth_data[pixel_coords_2D[:,1], pixel_coords_2D[:,0]][:,0]
     else:
         depths = depth_data
-    depths = torch.minimum(depths, torch.tensor(0.98).cuda())
+    #depths = torch.minimum(depths, torch.tensor(0.999).cuda())
 
     # Create homogenous normalized coordinates to match each depth map pixel.
     # Shape them into [B, 4].
@@ -630,6 +602,12 @@ def _depth_to_3D(depth_data, inv_projection, inv_view, znear, zfar,
 
     # Normalize to get the 3D coordinates
     point_3D = point_homogeneous_world[:,:3] / point_homogeneous_world[:,3].reshape([B, 1])
+
+    limit = 30
+    dists = torch.linalg.norm(point_3D, dim=1)
+    mask = dists >= limit
+    divisor = dists / limit * mask + ~mask * 1
+    point_3D = point_3D / divisor.unsqueeze(-1)
 
     if colour_map is not None:
         colours = colour_map.reshape([shape[0] * shape[1], 3])

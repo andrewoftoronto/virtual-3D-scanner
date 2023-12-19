@@ -1,7 +1,7 @@
 import open3d as o3d
 import numpy as np
 
-def run(points, colours, normals):
+def run(clouds, points, colours, normals):
 
     # Stack points, normals, and colors into a single array
 
@@ -10,10 +10,10 @@ def run(points, colours, normals):
     #colours = colours[keeps]
     #normals = normals[keeps]
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.normals = o3d.utility.Vector3dVector(normals)
-    pcd.colors = o3d.utility.Vector3dVector(colours)
+    #pcd = o3d.geometry.PointCloud()
+    #pcd.points = o3d.utility.Vector3dVector(points)
+    #pcd.normals = o3d.utility.Vector3dVector(normals)
+    #pcd.colors = o3d.utility.Vector3dVector(colours)
 
     #pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1e-1, max_nn=30))
 
@@ -36,7 +36,7 @@ def run(points, colours, normals):
         arrow.scale(0.1, center=np.asarray(pcd.points)[i])
         arrow_list.append(arrow)'''
 
-    o3d.visualization.draw_geometries([pcd])
+    o3d.visualization.draw_geometries(clouds)
     exit(0)
     print("Generating mesh")
     mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(pcd, o3d.utility.DoubleVector(radii))

@@ -2,6 +2,7 @@ from typing import List, Optional
 import os
 import numpy as np
 import cv2
+import gc
 from PIL import Image
 from .transforms import ProjectionParameters, Frame as TFrame, read_transforms
 from .matching.match_loader import load_matches, PointData
@@ -44,7 +45,11 @@ class Frame:
         return self.normal_map
     def get_depth(self):
         if isinstance(self.depth_map, DelayLoadMap):
-            self.depth_map = self.depth_map.load()
+            loaded = self.depth_map.load()
+            if loaded.shape[2] > 1:
+                loaded = loaded[:,:,:1]
+                gc.collect()
+            self.depth_map = loaded
         return self.depth_map
 
 
@@ -93,7 +98,7 @@ def load(transforms_path: str, foggy: bool = False):
     del transforms
 
     # Sort frames by name.
-    #frames.sort(key=lambda f: f.get_base_name())
+    frames.sort(key=lambda f: f.get_base_name())
 
     extra_images_path = os.path.join(base_path, "extra-images")
     extra_frame_names = []
