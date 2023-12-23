@@ -6,7 +6,7 @@ def mv(old_path, new_path):
 
 def main():
     source_folder = "C:/Program Files (x86)/Steam/steamapps/common/Valheim"
-    dest_folder = "C:/Users/Andrew/colmap-projects/forest"
+    dest_folder = "C:/Users/Andrew/colmap-projects/forest2"
 
     # Make dest folders.
     colour_dest = os.path.join(dest_folder, "images")

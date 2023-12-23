@@ -53,6 +53,7 @@ def read_transforms(file_path: str, foggy: bool = False) -> TransformsData:
 
         transform_matrix = np.array(transform_matrix).T
         transform_matrix = np.matmul(r, transform_matrix)
+        transform_matrix = transform_matrix.astype(np.float32)
 
         if foggy:
             frame_file_path = frame_file_path.replace('images', 'foggy-images')

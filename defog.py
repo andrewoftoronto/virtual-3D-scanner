@@ -28,5 +28,5 @@ def main(transforms_path):
     pass
 
 if __name__ == '__main__':
-    transforms_path = 'C:/Users/Andrew/colmap-projects/valheim/transforms.json'
+    transforms_path = 'C:/Users/Andrew/colmap-projects/forest/transforms.json'
     main(transforms_path=transforms_path)

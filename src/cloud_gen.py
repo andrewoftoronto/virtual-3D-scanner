@@ -63,11 +63,6 @@ def cloud_gen(scene: RawSceneData):
     w = scene.proj_params.w
     h = scene.proj_params.h
 
-    # Infer zparams using images that point to the same place.
-    #_infer_zparams(scene)
-    scene.proj_params.zfar = 999999999
-    scene.proj_params.znear = 0.08526150593834063
-
     proj = _perspective_projection_matrix(w, h, fl_x, fl_y, torch.tensor(scene.proj_params.znear, dtype=torch.float32), torch.tensor(scene.proj_params.zfar, dtype=torch.float32)).cuda().T
     inv = torch.linalg.inv(proj)
 
@@ -76,6 +71,8 @@ def cloud_gen(scene: RawSceneData):
     normals = np.zeros([0,3], dtype=np.float64)
     clouds = []
     for (i, frame) in enumerate(scene.frames):
+        if np.random.uniform() > 0.1:
+            continue
 
         transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
         inv_view = transform_matrix
@@ -637,7 +634,7 @@ def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y
 
 def _inverse_projection_matrix(width, height, camera_angle_x, camera_angle_y, znear, zfar):
     aspect_ratio = width / height
-    a = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
+    a = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_x)))
     b = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
     c = -(zfar + znear) / (2 * zfar * znear)
     d = (zfar - znear) / (2 * zfar * znear)
