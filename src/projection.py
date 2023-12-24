@@ -95,7 +95,7 @@ def make_projection_matrix(scene_data: RawSceneData):
         0, 0, -1, 0
     ]).reshape((4, 4))
 
-    return projection_matrix
+    return projection_matrix.T
 
 
 def make_inv_projection_matrix(scene_data: RawSceneData):
@@ -130,5 +130,5 @@ def make_inv_projection_matrix(scene_data: RawSceneData):
         _0,      _0,     d,   c
     ]).reshape((4, 4))
 
-    return inv_projection_matrix
+    return inv_projection_matrix.T
 

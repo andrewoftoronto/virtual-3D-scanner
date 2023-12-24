@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from .source_loader import RawSceneData
 import open3d as o3d
+from .projection import make_inv_projection_matrix, unproject
 
 
 class ColinearConstraint:
@@ -74,18 +75,11 @@ def cloud_gen(scene: RawSceneData):
         if np.random.uniform() > 0.1:
             continue
 
-        transform_matrix = torch.from_numpy(frame.transform).to(torch.float32).cuda()
-        inv_view = transform_matrix
-
-        depth_map = torch.from_numpy(frame.get_depth()).cuda()
-        #depth_map = torch.flip(depth_map, dims=[0])
-
-        # TODO: Codify this better.
         colour_map = torch.from_numpy(frame.get_colour()).cuda()
         colour_map = colour_map[:,:,:3] / 255
 
-        frame_coords, frame_colours, tex = _depth_to_3D(depth_map, inv, inv_view, scene.proj_params.znear, scene.proj_params.zfar, colour_map)
-        n_points = len(frame_coords)
+        frame_coords = unproject(scene, frame)
+        frame_colours = colour_map.reshape([-1, 3])
 
         shape = frame.get_depth().shape
         c = frame_coords.reshape([shape[0], shape[1], 3])
@@ -353,9 +347,7 @@ def _infer_zparams(scene: RawSceneData):
 
     shape = scene.frames[0].get_depth().shape
 
-    inv_proj = _inverse_projection_matrix(w, h, fl_x, fl_y, 
-            torch.tensor(0.1, dtype=torch.float32), 
-            torch.tensor(1000,  dtype=torch.float32)).T.cuda()
+    inv_proj = make_inv_projection_matrix(scene).T.cuda()
 
     f1 = scene.lookup('003')
     f2 = scene.lookup('006')
@@ -630,29 +622,6 @@ def _perspective_projection_matrix(width, height, camera_angle_x, camera_angle_y
     ]).reshape((4, 4))
 
     return projection_matrix
-
-
-def _inverse_projection_matrix(width, height, camera_angle_x, camera_angle_y, znear, zfar):
-    aspect_ratio = width / height
-    a = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_x)))
-    b = 1 / (torch.tan(torch.tensor(0.5 * camera_angle_y)))
-    c = -(zfar + znear) / (2 * zfar * znear)
-    d = (zfar - znear) / (2 * zfar * znear)
-
-    a = a.to(torch.float32)
-    b = b.to(torch.float32)
-
-    # Create the inverse projection matrix
-    _n1 = torch.tensor(-1)
-    _0 = torch.tensor(0)
-    inv_projection_matrix = torch.stack([
-        1 / a,   _0,     _0,  _0,
-        _0,      1 / b,  _0,  _0,
-        _0,      _0,     _0,  _n1,
-        _0,      _0,     d,   c
-    ]).reshape((4, 4))
-
-    return inv_projection_matrix
 
 
 def make_rotation(quaternions):

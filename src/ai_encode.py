@@ -31,7 +31,7 @@ def _identify_filled_blocks(scene_data: RawSceneData):
         # Find blocks that each world point would belong in.
         B = N_BITS_PER_BLOCK_DIM
         world_points = unproject(scene_data, frame, "cuda")
-        block_coords = torch.floor(world_points).to(torch.int64) + (1 << (B - 1))
+        block_coords = torch.floor(world_points).to(torch.int64)
         this_min, _ = torch.min(block_coords, dim=0)
         this_max, _ = torch.max(block_coords, dim=0)
         if minimum is None:
@@ -57,7 +57,8 @@ def _construct_octree(filled_block_indices_np, minimum_np, maximum_np):
     ''' Construct an octree using the indices of the filled blocks. '''
 
     # Create tree with root. n_levels excludes leaves.
-    n_levels = np.ceil(np.log2(maximum_np - minimum_np)).astype(np.int64)
+    greatest_range = (maximum_np - minimum_np).max()
+    n_levels = np.ceil(np.log2(greatest_range)).astype(np.int64)
     tree = -np.ones(shape=[1, 8], dtype=np.int64)
 
     # Decode block indices.
