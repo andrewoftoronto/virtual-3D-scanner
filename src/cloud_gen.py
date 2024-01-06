@@ -78,7 +78,7 @@ def cloud_gen(scene: RawSceneData):
         colour_map = torch.from_numpy(frame.get_colour()).cuda()
         colour_map = colour_map[:,:,:3] / 255
 
-        frame_coords = unproject(scene, frame)
+        frame_coords = unproject(scene, frame, max_dist=30)
         frame_colours = colour_map.reshape([-1, 3])
 
         shape = frame.get_depth().shape
