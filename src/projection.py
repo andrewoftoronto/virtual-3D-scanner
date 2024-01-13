@@ -33,11 +33,10 @@ def unproject(scene_data: RawSceneData, frame: Frame, compute_device="cuda",
 
 def unproject_ray(scene_data: RawSceneData, frame: Frame, compute_device="cuda"):
     ''' Create tensor of all world-space rays emitted from each pixel of the 
-        given frame.
+        given frame. Also includes, ray_maxes, the distance the ray travels
+        before hitting a solid surface based on the depth map.
       
-        Unlike unproject, this does not take into account the actual depth of
-        each frame. Instead it just creates a ray based on the frame's 
-        transformation and the camera projection parameters.
+        Returns ray_starts, ray_directions, ray_maxes
     '''
 
     proj = make_projection_matrix(scene_data)
@@ -52,12 +51,16 @@ def unproject_ray(scene_data: RawSceneData, frame: Frame, compute_device="cuda")
     ray_ends = depth_to_3D(depth_data, inv_proj, inv_view)
     ray_dirs = ray_ends - ray_starts
     ray_dirs /= torch.linalg.norm(ray_dirs, dim=1, keepdim=True)
-    return ray_starts, ray_dirs
+
+    depth_data = torch.from_numpy(frame.get_depth()).to(compute_device)
+    ray_maxes = torch.linalg.norm(depth_to_view(depth_data, inv_proj)[:, 0:3], dim=1)
+
+    return ray_starts, ray_dirs, ray_maxes
 
 
-def depth_to_3D(depth_data, inv_projection, inv_view,
-        pixel_coords_2D=None, uses_depth_map=True, shape=None):
-    ''' General and free-form function for computing 3D world space positions 
+def depth_to_view(depth_data, inv_projection, pixel_coords_2D=None, 
+        uses_depth_map=True, shape=None):
+    ''' General and free-form function for computing 3D view space positions 
         from a set of pixel coordinates and depth values. '''
     
     if pixel_coords_2D is None:
@@ -86,6 +89,16 @@ def depth_to_3D(depth_data, inv_projection, inv_view,
     # Calculate the view space coordinates
     view_coordinates = projected_coords @ inv_projection
     view_coordinates = view_coordinates / view_coordinates[:,3].reshape([B, 1])
+    return view_coordinates
+
+
+def depth_to_3D(depth_data, inv_projection, inv_view,
+        pixel_coords_2D=None, uses_depth_map=True, shape=None):
+    ''' General and free-form function for computing 3D world space positions 
+        from a set of pixel coordinates and depth values. '''
+    
+    view_coordinates = depth_to_view(depth_data, inv_projection, 
+            pixel_coords_2D, uses_depth_map, shape)
 
     # Calculate the world space coordinates
     if len(inv_view.shape) == 2:
@@ -95,7 +108,7 @@ def depth_to_3D(depth_data, inv_projection, inv_view,
         point_homogeneous_world = point_homogeneous_world.reshape([-1, 4])
 
     # Normalize to get the 3D coordinates
-    point_3D = point_homogeneous_world[:,:3] / point_homogeneous_world[:,3].reshape([B, 1])
+    point_3D = point_homogeneous_world[:,:3] / point_homogeneous_world[:,3].reshape([-1, 1])
 
     return point_3D
 

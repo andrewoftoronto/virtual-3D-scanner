@@ -11,14 +11,20 @@ N_BITS_PER_BLOCK_DIM = 20
 
 MAX_DIST = 30
 
+# Number of grid cells that subdivide a block.
+BLOCK_GRID_SIZE = 32
+
+# Number of blocks to process in one iteration of ray-block processing.
+N_BLOCKS_PER_IT = 64
+
 
 def run(scene_data: RawSceneData):
     ''' Run the ai-encoder on the given scene. '''
     
     filled_block_indices, minimum, maximum = _identify_filled_blocks(scene_data=scene_data)
-    tree, blocks = _construct_octree(filled_block_indices, minimum, maximum)
+    tree, blocks, block_starts = _construct_octree(filled_block_indices, minimum, maximum)
     #_test_octree(scene_data, tree, blocks)
-    _collect_data(scene_data, tree, blocks, len(filled_block_indices))
+    _collect_data(scene_data, tree, blocks, block_starts, len(filled_block_indices))
     pass
 
 
@@ -53,6 +59,174 @@ class Block:
     
     def __init__(self, min_coords):
         self.min_coords = min_coords
+
+
+class BlockDataCache:
+    def __init__(self, n_blocks, n_cells, device):
+        self.n_blocks = n_blocks
+        self.n_cells = n_cells
+        self.clock = 0
+        self.device_type = device
+
+        # All cells currently free to accept block data.
+        self.free_cells = torch.arange(n_cells, dtype=torch.int64, device=device)
+        
+        # Mapping of overall block index to cell index.
+        self.block_to_cell = -1 * torch.ones(size=[n_blocks], dtype=torch.int64, device=device)
+
+        # Mapping of cells to the block they contain. 
+        self.cell_to_block = -1 * torch.ones(size=[n_cells], dtype=torch.int64, device=device)
+
+        # Clock values for cells to determine eviction order.
+        self.cell_clocks = torch.zeros(size=[n_cells], dtype=torch.int64, device=device)
+
+        # Occupancy data for blocks.
+        self.occupancy = torch.zeros(
+                size=[n_cells, BLOCK_GRID_SIZE, BLOCK_GRID_SIZE, BLOCK_GRID_SIZE],
+                dtype=bool,
+                device=device
+        )
+
+        # Actual hit datapoints.
+
+
+    def load(self, block_indices, occupancy):
+        ''' Load block data into the cache.
+            Precondition: indicated blocks are not already in the cache.
+            Precondition: there are enough free blocks to load the data into;
+                this will not evict anything.
+         
+            block_indices: indices of the blocks to load. [N]
+            occupancy: occupancy data for the blocks. [N]
+        '''
+        assert(len(block_indices) <= self.n_cells)
+        assert(len(block_indices) <= len(self.free_cells))
+
+        block_indices = block_indices.to(self.device_type)
+        occupancy = occupancy.to(self.device_type)
+
+        cell_indices = self.free_cells[:len(block_indices)]
+        self.free_cells = self.free_cells[:len(block_indices)]
+
+        self.block_to_cell[block_indices] = cell_indices
+        self.cell_to_block[cell_indices] = block_indices
+        self.occupancy[cell_indices] = occupancy
+
+        # Mark that the cell has been accessed this clock cycle.
+        self.mark(cell_indices)
+        
+    def mark(self, cell_indices):
+        ''' Mark that cells have been accessed this clock cycle. '''
+        self.cell_clocks[cell_indices] = self.clock
+        self.clock += 1
+
+    def evict(self, cell_indices):
+        ''' Evict indicated cells, returning their data. '''
+
+        # This can be used both just to move data and for eviction.
+
+        # Precondition: Ensure cell_indices are all actually allocated.
+        # Load evicted cell data into tensors/list.
+        # Mark allocated mask as free there.
+        # Add cell_indices to free_cells. 
+        # Return the evicted data. Don't change device yet.
+        block_indices, occupancy = (
+                self.cell_to_block[cell_indices].clone(), 
+                self.occupancy[cell_indices].clone()
+        )
+
+        self.cell_to_block[cell_indices] = -1
+        self.block_to_cell[block_indices] = -1
+        self.free_cells = torch.concat((self.free_cells, cell_indices))
+
+        return block_indices, occupancy
+
+    def evict_n(self, n_cells):
+        ''' Evict the indicated number of cells, returning their data. '''
+
+        # Identify allocated cells.
+        allocated_cells = torch.where(self.cell_to_block != -1)
+
+        # Sort allocated cells by clock and choose the n oldest ones.
+        sort_order = torch.argsort(self.cell_clocks[allocated_cells])
+        evicted_cells = allocated_cells[sort_order][:n_cells]
+
+        return self.evict(evicted_cells)
+
+
+class BlockDataCacheSystem:
+    ''' Manages block data in a cache-like pattern to avoid out-of-memory on 
+        device and cpu.
+         
+        In this style of cache:
+        - A block is only loaded into one of either device or cpu at a time.
+        - Data can be loaded directly into device from disc.    
+    '''
+    
+    def __init__(self, n_total_blocks, n_cpu_blocks, n_device_blocks,
+            device_type="cuda"):
+        self.n_total_blocks = n_total_blocks
+        self.device_type = device_type
+        self.cpu_cache = BlockDataCache(n_total_blocks, n_cpu_blocks, device="cpu")
+        self.device_cache = BlockDataCache(n_total_blocks, n_device_blocks, device=device_type)
+
+    def ensure_loaded(self, block_indices):
+        ''' Ensures all the given blocks are resident in device cache. '''
+        assert(len(block_indices) <= self.device_cache.n_cells)
+
+        # Identify blocks that have not been loaded and then load them.
+        cache = self.device_cache
+        missing_mask = cache.block_to_cell[block_indices] == -1
+        missing_blocks = block_indices[missing_mask]
+        
+        # Load missing from cpu.
+        missing_blocks = missing_blocks.to("cpu")
+        cpu_cells = self.cpu_cache.block_to_cell[missing_blocks]
+        found_block_mask = cpu_cells != -1
+        found_blocks = missing_blocks[found_block_mask]
+        found_cells = cpu_cells[found_blocks]
+        if len(found_cells) > 0:
+            self.load('device', *self.cpu_cache.evict(found_cells))
+            if len(found_cells) == len(missing_blocks):
+                return
+        missing_blocks = missing_blocks[~found_block_mask]
+        del cpu_cells, found_block_mask, found_blocks, found_cells
+
+        # Load remaining from disc if they exist.
+        # TODO: Check disc.
+
+        # Otherwise, create new data for missing blocks.
+        new_occupancy = torch.zeros(
+                size=[len(missing_blocks), BLOCK_GRID_SIZE, BLOCK_GRID_SIZE, BLOCK_GRID_SIZE],
+                dtype=bool,
+                device=self.device_type
+        )
+        self.load('device', missing_blocks, new_occupancy)
+        
+    def load(self, cache_type, block_indices, occupancy):
+        ''' Load data into the indicated cache.
+        
+            Precondition: the given blocks are missing from the cache.
+        '''
+
+        cache = self.cpu_cache if cache_type == 'cpu' else self.device_cache
+        assert(len(block_indices) <= cache.n_cells)
+
+        # Get free cells. If not enough, we must evict.
+        n_free_cells = len(cache.free_cells)
+        if n_free_cells < len(block_indices):
+            evicted_data = cache.evict_n(len(block_indices) - n_free_cells)
+        else:
+            evicted_data = None
+        
+        # Now that we've made room, insert the data into the cache.
+        cache.load(block_indices, occupancy)
+
+        # Deal with data evicted from the cache to make room before.
+        if evicted_data is not None and cache_type == 'device':
+            self.load('cpu', *evicted_data)
+        elif evicted_data is not None: 
+            raise Exception("Eviction to make room in CPU is not implemented.")
 
 
 def _identify_filled_blocks(scene_data: RawSceneData):
@@ -103,6 +277,7 @@ def _construct_octree(filled_block_indices, minimum, maximum) -> Octree:
 
     n_blocks = len(filled_block_indices_np)
     blocks = [Block(coords[i].copy()) for i in range(0, n_blocks)]
+    block_starts = torch.from_numpy(coords).cuda()
 
     # Add each block to the tree one at a time.
     coords = coords - minimum_np
@@ -141,19 +316,24 @@ def _construct_octree(filled_block_indices, minimum, maximum) -> Octree:
 
     tree = Octree(tree, n_levels, minimum)
     tree.to_torch_cuda()
-    return tree, blocks
+    return tree, blocks, block_starts
 
 
 def _collect_data(scene_data: RawSceneData, tree: Octree, blocks: List,
-        n_blocks: int):
+        block_starts, n_blocks: int):
     ''' Raytrace through the scene from each frame at a time to identify
         boundaries and known outside voxels. '''
-    
+
+    # Note that this algorithm does not necessarily traverse blocks in a set 
+    # order.
+
+    cache = BlockDataCacheSystem(n_blocks, n_blocks, 128)
+
     # TODO: If too many blocks, we'll need to apply some kind of LRU cache
     # strategy and write to disk.
     for frame in scene_data.frames:
 
-        all_ray_starts, all_ray_dirs = unproject_ray(scene_data, frame)
+        all_ray_starts, all_ray_dirs, all_ray_maxes = unproject_ray(scene_data, frame)
 
         # Keeps track of what rays are still traversing.
         n_rays = 1 #len(all_ray_starts)
@@ -169,6 +349,7 @@ def _collect_data(scene_data: RawSceneData, tree: Octree, blocks: List,
         ray_stack_heads = torch.zeros([n_rays], dtype=torch.int64).cuda()
         ray_pos_stacks = torch.zeros([n_rays, tree.n_levels + 1, 3], dtype=torch.float).cuda()
         ray_pos_stacks[:,0] = tree.minimum.reshape([1, 3])
+        all_ray_ts = torch.zeros([n_rays], dtype=torch.float32).cuda()
 
         # Loop until all rays done.
         n_visits = 0
@@ -232,7 +413,7 @@ def _collect_data(scene_data: RawSceneData, tree: Octree, blocks: List,
                         stack_heads
                     ]
                     print("Parent minimums:", parent_minimums[0].cpu().numpy())
-                    levels = tree.n_levels - stack_heads - 1 # TODO: Verify.
+                    levels = tree.n_levels - stack_heads - 1
                     child_numbers = ray_stacks[
                         exist_child_ray_indices,
                         stack_heads,
@@ -243,14 +424,20 @@ def _collect_data(scene_data: RawSceneData, tree: Octree, blocks: List,
 
                     # For use later on, restrict child minimums to only show 
                     # the minimums of rays that will actually be entered.
-                    intersection_mask = _ray_box_intersect(
+                    intersection_mask, ray_mins_t, ray_maxes_t = _ray_box_intersect(
                             all_ray_starts[exist_child_ray_indices],
                             all_ray_dirs[exist_child_ray_indices],
+                            all_ray_maxes[exist_child_ray_indices],
                             box_mins=child_minimums,
                             box_maxes=child_maximums
                     )
                     child_minimums = child_minimums[intersection_mask]
                     enter_ray_indices = exist_child_ray_indices[intersection_mask]
+
+                    # Report t of first hit (must have actually intersected AND be positive).
+                    pos_t_mask = ray_mins_t[intersection_mask] >= 0
+                    all_ray_ts[enter_ray_indices] = (pos_t_mask) * ray_mins_t[intersection_mask] + ~pos_t_mask * ray_maxes_t[intersection_mask]
+
                 else:
                     print("Skipping child")
                     child_minimums = None
@@ -298,15 +485,62 @@ def _collect_data(scene_data: RawSceneData, tree: Octree, blocks: List,
             if len(remaining_ray_indices) == 0:
                 break
             
-            # Now run the the block traversal algorithm until every ray exits the
-            # block.
-            #block_traversal_ray_indices = remaining_ray_indices.clone()
-            #while len(block_traversal_ray_indices) > 0:
-            pass
+            # Run block traversal.
 
+            # First we identify where each ray begins relative to its block.
+            block_traversal_ray_indices = remaining_ray_indices.clone()
+            ray_block_indices = ray_stacks[:, -1, 0]
 
-        # Coalesce writes to the same blocks together.
-        pass
+            # Process blocks in groups (ordered by index).
+            unique_blocks = torch.unique(ray_block_indices)
+            n_hit_blocks = len(unique_blocks)
+            for i in range(0, n_hit_blocks, N_BLOCKS_PER_IT):
+
+                first_block_index = i
+                last_block_index = min(i + N_BLOCKS_PER_IT - 1, n_hit_blocks - 1)
+                cache.ensure_loaded(unique_blocks[first_block_index:last_block_index + 1])
+
+                # Pay attention only to rays that hit this group of blocks.
+                first_block = unique_blocks[first_block_index]
+                last_block = unique_blocks[last_block_index]
+                accept_mask = first_block <= ray_block_indices & ray_block_indices <= last_block
+                rays_this_it = block_traversal_ray_indices[accept_mask]
+
+                while True:
+
+                    # Compute ray head position.
+                    ray_heads = all_ray_starts[rays_this_it] + all_ray_dirs[rays_this_it] * (all_ray_ts[rays_this_it] + 1e-5)
+                    relative_ray_pos = ray_heads - block_starts[ray_block_indices[rays_this_it]]
+
+                    # Rays done when past maximum or out of cell bounds. 
+                    # Remember to delete entries for aux arrays.
+                    continue_mask = (
+                            (all_ray_ts[rays_this_it] <= all_ray_maxes[rays_this_it]) | 
+                            torch.all(torch.abs(relative_ray_pos) < 1, dim=1)
+                    )
+                    rays_this_it = rays_this_it[continue_mask]
+                    if len(rays_this_it) == 0:
+                        break
+                    ray_heads = ray_heads[continue_mask]
+                    relative_ray_pos = relative_ray_pos[continue_mask]
+
+                    # Mark current grid cell as having an open section.
+                    dest_block_indices = cache.device_cache.block_to_cell[ray_block_indices[rays_this_it]]
+                    grid_cells = torch.floor(relative_ray_pos * BLOCK_GRID_SIZE).to(torch.int64)
+                    cache.device_cache.occupancy[dest_block_indices, grid_cells[:, 2], grid_cells[:, 1], grid_cells[:, 0]] = True
+
+                    # Advance rays into the next grid cell by casting against 
+                    # the boundaries of the current cell.
+                    min_bounds = block_starts[ray_block_indices[rays_this_it]] + grid_cells / BLOCK_GRID_SIZE
+                    max_bounds = min_bounds + 1 / BLOCK_GRID_SIZE
+                    intersection_mask, _, ray_maxes_t = _ray_box_intersect(
+                            ray_origins=all_ray_starts[rays_this_it], 
+                            ray_directions=all_ray_dirs[rays_this_it],
+                            ray_maxes=all_ray_maxes[rays_this_it],
+                            box_mins=min_bounds,
+                            box_maxes=max_bounds
+                    )
+                    all_ray_ts[rays_this_it] = ray_maxes_t + 1e-5
 
 
 def _octree_child_to_coords(child_numbers, log_level):
@@ -320,7 +554,8 @@ def _octree_child_to_coords(child_numbers, log_level):
     return coords
 
 
-def _ray_box_intersect(ray_origins, ray_directions, box_mins, box_maxes):
+def _ray_box_intersect(ray_origins, ray_directions, ray_maxes,
+            box_mins, box_maxes):
 
     div0_mask = torch.abs(ray_directions) < 1e-8
     inv_dir = 1 / (div0_mask * 1e-8 + ray_directions)
@@ -330,8 +565,9 @@ def _ray_box_intersect(ray_origins, ray_directions, box_mins, box_maxes):
 
     tmin = torch.max(torch.minimum(t_mins, t_maxes), dim=1).values
     tmax = torch.min(torch.maximum(t_mins, t_maxes), dim=1).values
-    intersected = (tmax > tmin) & (tmax > 0)
-    return intersected
+    intersected = (ray_maxes >= tmin) & (tmax > tmin) & (tmax > 0)
+
+    return intersected, tmin, tmax
 
 
 def _compress_block_indices(block_coords):
